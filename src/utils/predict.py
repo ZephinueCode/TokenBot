@@ -173,8 +173,8 @@ if __name__ == "__main__":
                         help="Complete the text instead of predicting next token")
     parser.add_argument("-n", "--next", action="store_true",
                         help="Predict next token (default behavior)")
-    parser.add_argument("-i", "--image", type=str, default="./drawn.png",
-                        help="Path to image file (default: ./drawn.png)")
+    parser.add_argument("-i", "--image", type=str, default="./image.png",
+                        help="Path to image file (default: ./image.png)")
     
     args = parser.parse_args()
     
@@ -183,10 +183,10 @@ if __name__ == "__main__":
         args.next = True
     
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        "./checkpoints/Qwen3-VL-GUI-SFT",
+        "./checkpoints/Qwen3-VL-4B-Instruct",
         trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(
-        "./checkpoints/Qwen3-VL-GUI-SFT",
+        "./checkpoints/Qwen3-VL-4B-Instruct",
         trust_remote_code=True)
     
     # Load and encode image to base64
@@ -203,7 +203,7 @@ if __name__ == "__main__":
         {"role": "user", 
          "content": [
              {"type": "image", "image": image_url},
-             {"type": "text", "text": """<ACTION> Perform a step for the following action: Move to 'cut'."""}
+             {"type": "text", "text": """Describe the image."""}
          ]}
     ]
     

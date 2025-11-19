@@ -5,6 +5,7 @@ from typing import List, Dict, Tuple, Any
 from io import BytesIO
 
 from ..utils.parameters import HYPERPARAMS as HP
+from ..utils.prompts import AGENT_SYSTEM_PROMPT
 from ..utils.action_logic import MOVE_DELTAS, get_action_type
 from .visual_utils import draw_cursor
 
@@ -32,8 +33,6 @@ class GTStep:
 class GTTrajectory:
     """
     Holds the Ideal Ground Truth path.
-    Constructed from the dataset's 'ground_truth_traj' list.
-    Handles HuggingFace dataset image serialization (bytes -> PIL).
     """
     def __init__(self, gt_data: List[Dict]):
         self.steps = []
@@ -41,15 +40,13 @@ class GTTrajectory:
         for item in gt_data:
             img_data = item['image']
             
-            # === Handle HF Dataset Serialization ===
-            # HF often converts nested images into dicts {'bytes': b'...'}
+            # Handle HF Dataset Serialization (bytes -> PIL)
             if isinstance(img_data, dict):
                 if 'bytes' in img_data and img_data['bytes'] is not None:
                     image = Image.open(BytesIO(img_data['bytes'])).convert("RGB")
                 else:
-                    print(f"[Warning] GTTrajectory: Image dict missing bytes. Using black placeholder.")
+                    print(f"[Warning] GTTrajectory: Image dict missing bytes. Using placeholder.")
                     image = Image.new("RGB", (HP.IMAGE_SIZE, HP.IMAGE_SIZE), (0, 0, 0))
-            # Handle direct PIL Image (e.g. from local loading)
             elif isinstance(img_data, Image.Image):
                 image = img_data
             else:
@@ -73,14 +70,13 @@ class GTTrajectory:
 class AgentTrajectory:
     """
     Holds the dynamic execution path of the Agent.
-    Maintains state, history, and pass/fail status.
+    Maintains state, history, path coordinates, and pass/fail status.
     """
     def __init__(self, input_text: str, start_gt_step: GTStep):
         self.global_question = input_text
         
         # --- State ---
         self.current_gt_step_idx = 0
-        # We copy the image to avoid modifying the GT source
         self.current_base_image = start_gt_step.image.copy() 
         
         # Init Cursor at Center of the CURRENT image
@@ -88,21 +84,22 @@ class AgentTrajectory:
         self.cursor_pos = [w // 2, h // 2]
         
         # --- Evaluation Status ---
-        # 0=Success, 1=InvalidToken, 2=WrongType, 3=WrongPos, 4=Timeout/NoEnd
         self.failed = 0 
         self.gt_steps_passed = 0
         
         # --- History ---
         self.step_count = 0
-        self.tools = []       # List[str]: Token strings executed
-        self.images = []      # List[Image]: Visual history (screenshots WITH cursor)
+        self.tools = []       
+        self.images = []      
+        
+        # [NEW] Visual Path Recording
+        self.cursor_path = [tuple(self.cursor_pos)]
         
         # Render the initial frame (Step 0 state)
         self._update_visual_history()
 
     def _update_visual_history(self):
         """Draws cursor on current base image and appends to history."""
-        # Use visual_utils to draw cursor on the raw image
         viz_img = draw_cursor(
             self.current_base_image, 
             int(self.cursor_pos[0]), 
@@ -111,38 +108,34 @@ class AgentTrajectory:
         self.images.append(viz_img)
 
     def get_current_view(self) -> Image.Image:
-        """Returns the latest image with cursor drawn."""
         return self.images[-1]
 
     def move_cursor(self, dx, dy):
-        """
-        Updates cursor coordinates based on pixel deltas.
-        Respects the boundaries of the CURRENT image.
-        """
         w, h = self.current_base_image.size
         cx, cy = self.cursor_pos
         
-        # Clamp to image bounds
         nx = max(0, min(cx + dx, w - 1))
         ny = max(0, min(cy + dy, h - 1))
         
         self.cursor_pos = [nx, ny]
+        
+        # [NEW] Record Path
+        self.cursor_path.append((nx, ny))
+        
         self._update_visual_history()
 
     def advance_to_next_gt_step(self, next_gt_step: GTStep):
-        """
-        Called when agent successfully completes an interaction step.
-        Loads the next screen from GT and resets cursor.
-        """
         self.current_gt_step_idx += 1
         self.gt_steps_passed += 1
         
-        # Load new environment image
         self.current_base_image = next_gt_step.image.copy()
         
         # Reset cursor to center of the NEW image
         w, h = self.current_base_image.size
         self.cursor_pos = [w // 2, h // 2]
+        
+        # [NEW] Record Reset point as a jump in path (or just new start)
+        self.cursor_path.append((w // 2, h // 2))
         
         self._update_visual_history()
 
@@ -155,10 +148,6 @@ class Runner:
         print(f"[Runner] Initialized. Capable of dynamic resolution handling.")
 
     def check_hit(self, cursor_pos, bbox):
-        """
-        Checks if cursor is inside target bbox.
-        bbox format: [x1, y1, x2, y2]
-        """
         cx, cy = cursor_pos
         x1, y1, x2, y2 = bbox
         return (x1 <= cx <= x2) and (y1 <= cy <= y2)
@@ -168,7 +157,7 @@ class Runner:
         model,
         processor,
         input_text: str,
-        ground_truth_data: List[Dict], # List of dicts from Dataset
+        ground_truth_data: List[Dict],
         max_steps: int = 10,
         temperature: float = 1.0
     ) -> Tuple[AgentTrajectory, List[int], List[float]]:
@@ -186,34 +175,26 @@ class Runner:
         # === ACTION LOOP ===
         for step in range(max_steps):
             agent_traj.step_count += 1
-            
-            # Get current goal (BBox and Type)
             current_gt = gt_traj.get_step(agent_traj.current_gt_step_idx)
             
-            # -------------------------------------------------------
             # 1. Build Prompt
-            # -------------------------------------------------------
             messages = [
+                {"role": "system", "content": AGENT_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": [
                         {"type": "image", "image": agent_traj.get_current_view()},
-                        # Explicitly tell model where the cursor is (CoT helper)
                         {"type": "text", "text": f"[Action] Perform a step for the following action: {agent_traj.global_question}\nCurrent Cursor: {agent_traj.cursor_pos}"}
                     ]
                 }
             ]
             
-            # Add Action History (Short-term memory)
             if agent_traj.tools:
                 hist_str = "\nAction History:\n" + "\n".join([f"- {t}" for t in agent_traj.tools])
                 messages[1]["content"].append({"type": "text", "text": hist_str})
 
-            # -------------------------------------------------------
-            # 2. Inference (Forward Pass)
-            # -------------------------------------------------------
+            # 2. Inference
             text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            
             inputs = processor(
                 text=[text_prompt],
                 images=[agent_traj.get_current_view()],
@@ -225,89 +206,62 @@ class Runner:
                 outputs = model(**inputs)
                 logits = outputs.logits[0, -1, :]
                 
-                # Sampling Strategy
                 if temperature == 0.0:
                     token_id = torch.argmax(logits).item()
                 else:
-                    # Apply temperature
                     scaled_logits = logits / temperature
                     probs = torch.softmax(scaled_logits, dim=-1)
                     token_id = torch.multinomial(probs, 1).item()
                 
-                # Calculate logprob (for PPO/GRPO)
                 log_prob = torch.log_softmax(logits, dim=-1)[token_id].item()
 
-            # Decode Token
             token_text = processor.decode([token_id], skip_special_tokens=False)
             
-            # Save step data
             all_token_ids.append(token_id)
             all_logprobs.append(log_prob)
             agent_traj.tools.append(token_text)
             
-            # -------------------------------------------------------
-            # 3. Execution & Validation Logic
-            # -------------------------------------------------------
+            # 3. Execution
             token_action_type = get_action_type(token_text)
             
-            # --- CASE A: MOVEMENT ---
             if token_action_type == "move":
                 if token_text in MOVE_DELTAS:
                     dx, dy = MOVE_DELTAS[token_text]
-                    # Move cursor (Visual state updates inside)
                     agent_traj.move_cursor(dx, dy)
                 else:
-                    agent_traj.failed = 1 # Invalid/Hallucinated move token
+                    agent_traj.failed = 1 # Invalid
                     break
             
-            # --- CASE B: INTERACTION (Click, Scroll, etc.) ---
             elif token_action_type in ["click", "scroll", "text", "nav"]:
-                
-                # Validation 1: Is this the correct TYPE of action? (e.g. Click vs Scroll)
                 if token_action_type != current_gt.action_type:
                     print(f" [Fail] Wrong Type. Expected {current_gt.action_type}, got {token_action_type}")
                     agent_traj.failed = 2 
                     break
                 
-                # Validation 2: Is the position correct? (BBox Check)
                 if self.check_hit(agent_traj.cursor_pos, current_gt.bbox):
-                    # HIT!
-                    
-                    # Are there more steps in the GT sequence?
+                    # HIT
                     if agent_traj.current_gt_step_idx < gt_traj.total_steps - 1:
-                        # Yes: Load next screen
                         next_step = gt_traj.get_step(agent_traj.current_gt_step_idx + 1)
                         agent_traj.advance_to_next_gt_step(next_step)
                     else:
-                        # No: Task "Functionally" complete, waiting for agent to say END
-                        # Increment step count to signal we passed the last GT step
                         agent_traj.current_gt_step_idx += 1
-                        agent_traj.gt_steps_passed += 1 # Ensure count reflects this hit
+                        agent_traj.gt_steps_passed += 1
                 else:
-                    # MISS!
-                    agent_traj.failed = 3 
+                    agent_traj.failed = 3 # Wrong Pos
                     break
             
-            # --- CASE C: TERMINATION ---
             elif token_action_type == "end":
-                # Only valid if we have completed all GT steps
                 if agent_traj.current_gt_step_idx >= gt_traj.total_steps:
                     agent_traj.failed = 0 # Success
                 else:
-                    agent_traj.failed = 4 # Premature Stop
+                    agent_traj.failed = 4 # Premature
                 break
-            
-            # --- CASE D: GARBAGE ---
             else:
-                agent_traj.failed = 1 # Invalid Token
+                agent_traj.failed = 1 # Garbage
                 break
         
-        # -------------------------------------------------------
-        # 4. Post-Loop Checks
-        # -------------------------------------------------------
-        # If max steps reached without explicit success or fail state
         if agent_traj.failed == 0 and agent_traj.step_count >= max_steps:
              if "END_ACTION" not in agent_traj.tools[-1]:
-                 agent_traj.failed = 4 # Timeout (Did not stop)
+                 agent_traj.failed = 4 # Timeout
 
         return agent_traj, all_token_ids, all_logprobs

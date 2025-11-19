@@ -1,64 +1,55 @@
-# src/eval/evaluate.py
-
 import torch
 import os
 import json
 from tqdm import tqdm
 from datetime import datetime
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from PIL import Image # Need to handle image extraction if needed
 
 from ..utils.parameters import HYPERPARAMS as HP
 from ..utils.dataset import prepare_grpo1_dataset
 from ..tools.runner import Runner, ToolData, AgentTrajectory
 from ..train.reward import batch_compute_rewards
 from .baseline_vlm import BaselineAPIRunner
+from ..tools.visual_utils import visualize_trajectory # <--- Import Viz
 
 def evaluate_model(mode="trained", num_samples=None):
-    """
-    Args:
-        mode: 
-            "trained"     -> Local SFT/RL Model + Local Runner.
-            "api_baseline"-> 235B API Model + Zero-Shot Prompt.
-    """
-    # 1. Config & Init
+    # ... (Init code same as before) ...
     dataset = prepare_grpo1_dataset(HP.EVAL_DATA_PATH, size=num_samples)
     
-    runner = None
-    model = None
-    processor = None
+    # Setup Directories
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_dir = os.path.join(HP.EVAL_OUTPUT_DIR, f"{mode}_{timestamp}")
+    img_save_dir = os.path.join(result_dir, "images")
+    os.makedirs(img_save_dir, exist_ok=True)
     
     if mode == "api_baseline":
-        print(f"[EVAL] Mode: API BASELINE (Qwen-235B)")
+        print(f"[EVAL] Mode: API BASELINE")
         runner = BaselineAPIRunner()
-        # No model/processor needed for API runner (it handles client internally)
-        
-    else: # trained
-        model_path = HP.GRPO1_OUTPUT_PATH # Default to GRPO, or change to SFT
+        model = None
+        processor = None
+    else:
+        model_path = HP.GRPO1_OUTPUT_PATH 
         print(f"[EVAL] Mode: TRAINED MODEL ({model_path})")
         runner = Runner()
-        
         try:
             model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True
             )
             processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         except Exception as e:
-            print(f"Error loading local model: {e}")
+            print(f"Error: {e}")
             return
-    
+            
     print(f"[EVAL] Dataset size: {len(dataset)}")
     
-    # 2. Evaluation Loop
     results = []
     success_count = 0
     total_steps = 0
     total_reward = 0
     
-    # Use tqdm for progress
     for i, sample in tqdm(enumerate(dataset), total=len(dataset)):
-        
         # Run Trajectory
-        # Note: API Runner ignores model/processor args
         if mode == "api_baseline":
             traj, _, _ = runner.run_trajectory(
                 input_text=sample['question'],
@@ -70,19 +61,42 @@ def evaluate_model(mode="trained", num_samples=None):
             traj, _, _ = runner.run_trajectory(
                 model=model,
                 processor=processor,
-                input_data=tool_input,
-                ground_truth_bbox=sample['ground_truth_traj'], # Local runner specific arg name
+                input_text=sample['question'], 
+                ground_truth_data=sample['ground_truth_traj'],
                 max_steps=HP.EVAL_MAX_STEPS,
                 temperature=0.0
             )
         
-        # Compute Metric
+        # Metrics
         is_success = (traj.failed == 0)
         if is_success: success_count += 1
         total_steps += traj.step_count
         reward = batch_compute_rewards([traj])[0]
         total_reward += reward
         
+        # === VISUALIZATION LOGIC ===
+        # Get base image (Step 0)
+        # Note: sample['image'] is already a PIL image from dataset loader
+        base_img = sample['image'].convert("RGB")
+        
+        # Get GT BBox (Step 0)
+        gt_bbox = sample['ground_truth_traj'][0]['bbox']
+        
+        # Draw
+        viz_img = visualize_trajectory(
+            base_image=base_img,
+            cursor_path=traj.cursor_path, 
+            actions=traj.tools,
+            gt_bbox=gt_bbox,
+            success=is_success
+        )
+        
+        # Save
+        status_str = "PASS" if is_success else "FAIL"
+        img_filename = f"{i:04d}_{status_str}.png"
+        viz_img.save(os.path.join(img_save_dir, img_filename))
+        # ===========================
+
         results.append({
             "id": i,
             "instruction": sample['question'],
@@ -90,10 +104,11 @@ def evaluate_model(mode="trained", num_samples=None):
             "steps": traj.step_count,
             "reward": reward,
             "fail_reason": traj.failed,
-            "history": traj.tools
+            "history": traj.tools,
+            "vis_image": img_filename
         })
         
-    # 3. Summary
+    # Summary
     count = len(dataset)
     accuracy = success_count / count
     avg_steps = total_steps / count
@@ -106,24 +121,16 @@ def evaluate_model(mode="trained", num_samples=None):
     print(f"Avg Reward: {avg_reward:.2f}")
     print("="*40 + "\n")
     
-    # 4. Save
-    os.makedirs(HP.EVAL_OUTPUT_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join(HP.EVAL_OUTPUT_DIR, f"{mode}_eval_{timestamp}.json")
-    
-    with open(save_path, "w") as f:
+    # Save JSON
+    json_path = os.path.join(result_dir, "report.json")
+    with open(json_path, "w") as f:
         json.dump({
             "meta": {"mode": mode, "samples": count},
             "metrics": {"accuracy": accuracy, "avg_steps": avg_steps, "avg_reward": avg_reward},
             "details": results
         }, f, indent=2)
     
-    print(f"Saved detailed results to {save_path}")
+    print(f"Results saved to {result_dir}")
 
 if __name__ == "__main__":
-    # Usage:
-    # 1. To test API Baseline:
-    evaluate_model(mode="api_baseline", num_samples=HP.EVAL_DATASET_SIZE)
-    
-    # 2. To test Trained Model:
-    # evaluate_model(mode="trained", num_samples=HP.EVAL_DATASET_SIZE)
+    evaluate_model(mode="trained", num_samples=HP.EVAL_DATASET_SIZE)
