@@ -56,6 +56,6 @@ class HYPERPARAMS:
     
     # Evaluation Config
     EVAL_DATA_PATH = "rootsautomation/ScreenSpot"
-    EVAL_DATASET_SIZE = 50 # Number of samples to test
-    EVAL_MAX_STEPS = 10
+    EVAL_DATASET_SIZE = 1 # Number of samples to test
+    EVAL_MAX_STEPS = 100
     EVAL_OUTPUT_DIR = "./eval_results"

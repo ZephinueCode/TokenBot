@@ -1,6 +1,8 @@
 import torch
+import numpy as np
 from PIL import Image
 from typing import List, Dict, Tuple, Any
+from io import BytesIO
 
 from ..utils.parameters import HYPERPARAMS as HP
 from ..utils.action_logic import MOVE_DELTAS, get_action_type
@@ -31,16 +33,36 @@ class GTTrajectory:
     """
     Holds the Ideal Ground Truth path.
     Constructed from the dataset's 'ground_truth_traj' list.
+    Handles HuggingFace dataset image serialization (bytes -> PIL).
     """
     def __init__(self, gt_data: List[Dict]):
         self.steps = []
+        
         for item in gt_data:
+            img_data = item['image']
+            
+            # === Handle HF Dataset Serialization ===
+            # HF often converts nested images into dicts {'bytes': b'...'}
+            if isinstance(img_data, dict):
+                if 'bytes' in img_data and img_data['bytes'] is not None:
+                    image = Image.open(BytesIO(img_data['bytes'])).convert("RGB")
+                else:
+                    print(f"[Warning] GTTrajectory: Image dict missing bytes. Using black placeholder.")
+                    image = Image.new("RGB", (HP.IMAGE_SIZE, HP.IMAGE_SIZE), (0, 0, 0))
+            # Handle direct PIL Image (e.g. from local loading)
+            elif isinstance(img_data, Image.Image):
+                image = img_data
+            else:
+                print(f"[Warning] GTTrajectory: Unknown image type {type(img_data)}. Using placeholder.")
+                image = Image.new("RGB", (HP.IMAGE_SIZE, HP.IMAGE_SIZE), (0, 0, 0))
+
             self.steps.append(GTStep(
-                image=item['image'],
+                image=image,
                 bbox=item['bbox'],
                 instruction=item['instruction'],
                 action_type=item['action_type']
             ))
+            
         self.total_steps = len(self.steps)
 
     def get_step(self, idx: int) -> GTStep:
@@ -68,6 +90,7 @@ class AgentTrajectory:
         # --- Evaluation Status ---
         # 0=Success, 1=InvalidToken, 2=WrongType, 3=WrongPos, 4=Timeout/NoEnd
         self.failed = 0 
+        self.gt_steps_passed = 0
         
         # --- History ---
         self.step_count = 0
@@ -112,6 +135,7 @@ class AgentTrajectory:
         Loads the next screen from GT and resets cursor.
         """
         self.current_gt_step_idx += 1
+        self.gt_steps_passed += 1
         
         # Load new environment image
         self.current_base_image = next_gt_step.image.copy()
@@ -256,7 +280,9 @@ class Runner:
                         agent_traj.advance_to_next_gt_step(next_step)
                     else:
                         # No: Task "Functionally" complete, waiting for agent to say END
+                        # Increment step count to signal we passed the last GT step
                         agent_traj.current_gt_step_idx += 1
+                        agent_traj.gt_steps_passed += 1 # Ensure count reflects this hit
                 else:
                     # MISS!
                     agent_traj.failed = 3 
