@@ -205,7 +205,7 @@ if __name__ == "__main__":
         {"role": "user", 
          "content": [
              {"type": "image", "image": image_url},
-             {"type": "text", "text": """[Action] Close the tab."""}
+             {"type": "text", "text": """[Action] Don't move the cursor up. Move the opposite way."""}
          ]}
     ]
     

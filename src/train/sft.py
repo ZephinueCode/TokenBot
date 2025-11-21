@@ -119,7 +119,7 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
         reasoning = "Reasoning: "
         
         if mode == "back":
-            reasoning += "The instruction is a system navigation command. "
+            reasoning += "I need to go back to the last page. "
             reasoning += "I do not need to interact with a specific element on the screen. "
             reasoning += "I need to return to the previous state. "
             action = "<GO_BACK>"
@@ -145,8 +145,44 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
     reasoning = "Reasoning: "
     reasoning += f"The cursor is currently in the **{c_region}** region. "
     reasoning += f"The target '{target_name}' is located in the **{t_region}** region. "
+
+    # === [NEW] Relative Position Logic ===
+    if c_region == t_region:
+        reasoning += f"I need to examine the position more carefully. "
     
-    HIT_THRESHOLD = 30 
+    dx = tx - cx
+    dy = ty - cy
+    margin = 15
+    
+    v_rel = ""
+    h_rel = ""
+
+    if dy < -margin:
+        v_rel = "Top"
+    elif dy > margin:
+        v_rel = "Bottom"
+    
+    if dx < -margin:
+        h_rel = "Left"
+    elif dx > margin:
+        h_rel = "Right"
+    
+    rel_pos_str = ""
+    if v_rel and h_rel:
+        rel_pos_str = f"{v_rel}-{h_rel}"  # Top-Left, Bottom-Right
+    elif v_rel:
+        rel_pos_str = v_rel               # Top
+    elif h_rel:
+        rel_pos_str = h_rel               # Right
+    else:
+        rel_pos_str = "Overlapping"
+
+    if rel_pos_str != "Overlapping":
+        reasoning += f"The target is to the **{rel_pos_str}** of the cursor. "
+    else:
+        reasoning += f"The cursor is right on the target. "
+    
+    HIT_THRESHOLD = 15
     action = ""
     
     if dist < HIT_THRESHOLD:
@@ -200,7 +236,7 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
     return f"{reasoning}\nAction: {action}"
 
 # =============================================================================
-# 2. Dataset
+# 2. Dataset (MODIFIED: 5:3:2 Split + Prompt Diversity)
 # =============================================================================
 class SFTDataset(Dataset):
     def __init__(self, data_path):
@@ -220,8 +256,25 @@ class SFTDataset(Dataset):
         
         print(f"[Dataset] Total Samples: {self.total_len}")
         
-        self.ui_names = ["Submit", "Cancel", "Search", "Menu", "Settings", "Back"]
-        self.text_contents = ["hello", "test"]
+        self.ui_names = ["Submit", "Cancel", "Search", "Menu", "Settings", "Back", "Profile", "Login"]
+        self.text_contents = ["hello", "test", "123456", "user", "admin"]
+        
+        # [NEW] Diverse Prompt Templates for better generalization
+        self.prompts_click = [
+            "Click {name}", "Select {name}", "Tap on {name}", "Hit the {name} button", "Choose {name}"
+        ]
+        self.prompts_move = [
+            "Move cursor to {name}", "Hover over {name}", "Point at {name}", "Go to {name}", "Find {name}"
+        ]
+        self.prompts_text = [
+            "Type '{content}' into {name}", "Enter '{content}' in {name}", "Fill {name} with '{content}'", "Input '{content}'"
+        ]
+        self.prompts_back = [
+            "Go back", "Return to previous page", "Back", "Navigate back"
+        ]
+        self.prompts_home = [
+            "Go home", "Return to main screen", "Home", "Main menu", "Exit to desktop"
+        ]
 
     def _load_real_images(self, limit=200):
         images = []
@@ -260,72 +313,100 @@ class SFTDataset(Dataset):
             msgs = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + item["messages"]
             return {"messages": msgs, "image": image}
 
-        # === TYPE 2: SPATIAL & NAVIGATION (Synthetic) ===
+        # === TYPE 2: SPATIAL & NAVIGATION (Synthetic) - 5:3:2 Split ===
         else:
             image = self.get_random_background()
             draw = ImageDraw.Draw(image)
             margin = 50
             
-            task_rng = random.random()
+            sample_rng = random.random()
             
-            # --- A. NAVIGATION TASK ---
-            if task_rng < 0.15:
-                intent_mode = random.choice(["back", "home"])
-                intent = {"type": "nav", "mode": intent_mode, "name": "System"}
+            tx = random.randint(margin, HP.IMAGE_SIZE - margin)
+            ty = random.randint(margin, HP.IMAGE_SIZE - margin)
+            target_name = random.choice(self.ui_names)
+            
+            # ----------------------------------------------------------
+            # CASE A: Moving (50%) - Force <MOVE>
+            # Cursor: FAR from target (>100px)
+            # Intent: Random (User wants Click/Move/Text, but needs to move first)
+            # ----------------------------------------------------------
+            if sample_rng < 0.5:
+                # Ensure cursor is far enough
+                while True:
+                    cx = random.randint(margin, HP.IMAGE_SIZE - margin)
+                    cy = random.randint(margin, HP.IMAGE_SIZE - margin)
+                    if math.hypot(cx-tx, cy-ty) > 100: break
                 
-                if intent_mode == "back":
-                    instr = random.choice(["Go back", "Return to previous page", "Back"])
+                # Intent can be varied, instructions reflect user goal
+                sub_type = random.choice(["click", "move", "text"])
+                if sub_type == "click":
+                    intent = {"type": "click", "name": target_name}
+                    instr_tmpl = random.choice(self.prompts_click)
+                elif sub_type == "move":
+                    intent = {"type": "move", "name": target_name}
+                    instr_tmpl = random.choice(self.prompts_move)
                 else:
-                    instr = random.choice(["Go home", "Return to main screen", "Home"])
+                    content = random.choice(self.text_contents)
+                    intent = {"type": "text", "name": target_name, "content": content}
+                    instr_tmpl = random.choice(self.prompts_text)
                 
-                # Distractors only
-                cx = random.randint(margin, HP.IMAGE_SIZE - margin)
-                cy = random.randint(margin, HP.IMAGE_SIZE - margin)
-                for _ in range(random.randint(3, 6)):
-                    dx = random.randint(margin, HP.IMAGE_SIZE - margin)
-                    dy = random.randint(margin, HP.IMAGE_SIZE - margin)
-                    draw.rectangle([dx-30, dy-20, dx+30, dy+20], outline="blue", width=2)
-                
-                draw.line([(cx-15, cy), (cx+15, cy)], fill="red", width=4)
-                draw.line([(cx, cy-15), (cx, cy+15)], fill="red", width=4)
-                
-                tx, ty = 0, 0 
+                instr = instr_tmpl.format(name=target_name, content=intent.get("content", ""))
 
-            # --- B. INTERACTION TASK ---
+            # ----------------------------------------------------------
+            # CASE B: Direct Clicking (30%) - Force <CLICK>
+            # Cursor: ON target (<15px), may require slight adjustments.
+            # Intent: Click
+            # ----------------------------------------------------------
+            elif sample_rng < 0.8:
+                cx = tx + random.randint(-20, 20)
+                cy = ty + random.randint(-20, 20)
+                intent = {"type": "click", "name": target_name}
+                instr = random.choice(self.prompts_click).format(name=target_name)
+
+            # ----------------------------------------------------------
+            # CASE C: Other Tasks (20%) - Text & Nav
+            # ----------------------------------------------------------
             else:
-                tx = random.randint(margin, HP.IMAGE_SIZE - margin)
-                ty = random.randint(margin, HP.IMAGE_SIZE - margin)
-                target_name = random.choice(self.ui_names)
-                
-                cx = random.randint(margin, HP.IMAGE_SIZE - margin)
-                cy = random.randint(margin, HP.IMAGE_SIZE - margin)
-                if random.random() < 0.3: cx, cy = tx + random.randint(-5,5), ty + random.randint(-5,5)
+                # Split 50/50 between Text (Ready) and Nav
+                if random.random() < 0.5:
+                    # Text Ready (Cursor ON target)
+                    cx = tx + random.randint(-10, 10)
+                    cy = ty + random.randint(-10, 10)
+                    content = random.choice(self.text_contents)
+                    intent = {"type": "text", "name": target_name, "content": content}
+                    instr = random.choice(self.prompts_text).format(name=target_name, content=content)
+                else:
+                    # Navigation (Cursor random, Target irrelevant/invisible)
+                    intent_mode = random.choice(["back", "home"])
+                    intent = {"type": "nav", "mode": intent_mode, "name": "System"}
+                    cx = random.randint(margin, HP.IMAGE_SIZE - margin)
+                    cy = random.randint(margin, HP.IMAGE_SIZE - margin)
+                    tx, ty = 0, 0 # Hide target
+                    
+                    if intent_mode == "back":
+                        instr = random.choice(self.prompts_back)
+                    else:
+                        instr = random.choice(self.prompts_home)
 
-                for _ in range(random.randint(2, 4)):
-                    dx = random.randint(margin, HP.IMAGE_SIZE - margin)
-                    dy = random.randint(margin, HP.IMAGE_SIZE - margin)
-                    if abs(dx - tx) > 60 or abs(dy - ty) > 60:
-                        draw.rectangle([dx-30, dy-20, dx+30, dy+20], outline="blue", width=2)
-
+            # --- Drawing Logic ---
+            # Only draw target for non-Nav tasks
+            if intent.get("type") != "nav":
                 draw.rectangle([tx-30, ty-20, tx+30, ty+20], outline="green", width=3)
                 try: draw.text((tx-20, ty-35), target_name, fill="green")
                 except: pass
-                
-                draw.line([(cx-15, cy), (cx+15, cy)], fill="red", width=4)
-                draw.line([(cx, cy-15), (cx, cy+15)], fill="red", width=4)
+            
+            # Draw Cursor
+            draw.line([(cx-15, cy), (cx+15, cy)], fill="red", width=4)
+            draw.line([(cx, cy-15), (cx, cy+15)], fill="red", width=4)
+            
+            # Draw Distractors (Noise)
+            for _ in range(random.randint(2, 5)):
+                dx = random.randint(margin, HP.IMAGE_SIZE - margin)
+                dy = random.randint(margin, HP.IMAGE_SIZE - margin)
+                if abs(dx - tx) > 60 or abs(dy - ty) > 60:
+                    draw.rectangle([dx-30, dy-20, dx+30, dy+20], outline="blue", width=2)
 
-                intent_type = random.choice(["click", "move", "text"])
-                intent = {"type": intent_type, "name": target_name}
-                
-                if intent_type == "text":
-                    intent["content"] = random.choice(self.text_contents)
-                    instr = f"Type '{intent['content']}' into {target_name}"
-                elif intent_type == "click":
-                    instr = f"Click {target_name}"
-                else:
-                    instr = f"Move cursor to {target_name}"
-
-            # Generate Response with Special Tokens
+            # Generate Label
             cot_response = get_spatial_label_with_cot((cx, cy), (tx, ty), intent)
             
             msgs = [
@@ -337,7 +418,7 @@ class SFTDataset(Dataset):
             return {"messages": msgs, "image": image}
 
 # =============================================================================
-# 3. Collator
+# 3. Collator (Unchanged)
 # =============================================================================
 @dataclass
 class SFTDataCollator:

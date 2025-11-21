@@ -1,6 +1,8 @@
 # src/train/grpo_1.py
 
 import torch
+import os
+import glob # [NEW] needed for searching checkpoints
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from trl import GRPOConfig
 
@@ -8,10 +10,34 @@ from ..utils.parameters import HYPERPARAMS as HP
 from ..utils.dataset import prepare_grpo1_dataset, train_eval_split
 from ..tools.runner import Runner
 from .trainer import ToolGRPOTrainer
-from ..utils.action import ACTION_TOKENS # Import Action Tokens for freezing logic
+from ..utils.action import ACTION_TOKENS 
+
+def get_last_checkpoint(output_dir):
+    """
+    Helper to find the latest checkpoint directory.
+    Returns None if no checkpoints found.
+    """
+    if not os.path.exists(output_dir):
+        return None
+    
+    # Check for subdirectories named 'checkpoint-*'
+    checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*"))
+    if not checkpoints:
+        return None
+    
+    # Sort by step number (assuming format checkpoint-X)
+    try:
+        # Extract number from path and sort
+        latest_ckpt = max(checkpoints, key=lambda x: int(x.split("-")[-1]))
+        return latest_ckpt
+    except ValueError:
+        return None
 
 def run_grpo_1():
     print(f"[GRPO-1] Initializing Pipeline...")
+    
+    # ... (Loading Model, Processor, Dataset, Runner code remains UNCHANGED) ...
+    # [省略中间重复代码，请保持原样]
     
     # 1. Load Post-SFT Model
     model_path = HP.SFT_OUTPUT_PATH 
@@ -25,16 +51,15 @@ def run_grpo_1():
     )
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     
-    # 2. Prepare Dataset
+    # 2. Dataset
     full_dataset = prepare_grpo1_dataset(HP.GRPO1_DATA_PATH, size=HP.GRPO_DATASET_SIZE)
-    train_data, eval_data = train_eval_split(full_dataset, eval_ratio=0.1)
-    
+    train_data, eval_data = train_eval_split(full_dataset, eval_ratio=0.05)
     print(f"[GRPO-1] Data: {len(train_data)} Train, {len(eval_data)} Eval")
     
-    # 3. Initialize Runner
+    # 3. Runner
     runner = Runner()
     
-    # 4. Config
+    # 4. Config (Output path is HP.GRPO1_OUTPUT_PATH)
     training_args = GRPOConfig(
         output_dir=HP.GRPO1_OUTPUT_PATH,
         learning_rate=HP.GRPO1_LEARN_RATE,
@@ -50,11 +75,9 @@ def run_grpo_1():
         temperature=HP.GRPO1_TEMPERATURE,
         report_to="none",
         remove_unused_columns=False,
-        beta=0.02, # KL Penalty
+        warmup_ratio=0.05,
+        beta=0.02, 
         
-        # ============================================================
-        # [NEW] Evaluation Configuration
-        # ============================================================
         do_eval=True,
         eval_strategy="steps",
         eval_steps=HP.GRPO1_EVAL_STEPS, 
@@ -64,7 +87,6 @@ def run_grpo_1():
         load_best_model_at_end=True,
         metric_for_best_model="eval_reward",
         greater_is_better=True,
-        # ============================================================
     )
     
     # 5. Trainer
@@ -80,39 +102,37 @@ def run_grpo_1():
     )
     
     # =========================================================================
-    # CRITICAL: Apply Surgical Freeze Hook to GRPO Model
+    # CRITICAL: Re-apply Freezing Strategy (NO HOOKS, matching SFT)
     # =========================================================================
-    print("[GRPO-1] Re-applying Surgical Embedding Hooks for RL...")
+    print("[GRPO-1] Re-applying Freezing Strategy...")
     
-    # 1. Identify Action IDs
-    action_token_ids = [
-        processor.tokenizer.convert_tokens_to_ids(t) 
-        for t in ACTION_TOKENS
-    ]
-    action_token_ids = [idx for idx in action_token_ids if idx is not None]
-    target_indices_tensor = torch.tensor(action_token_ids)
+    # [UPDATE] Remove the hook logic to match your SFT strategy
+    # Freeze Vision, Unfreeze Full LLM
     
-    # 2. Hook Function
-    def gradient_mask_hook(grad):
-        mask = torch.zeros_like(grad)
-        indices = target_indices_tensor.to(grad.device)
-        mask[indices] = 1.0
-        return grad * mask
-
-    # 3. Enable Grads & Register
-    model.enable_input_require_grads()
-    input_embeddings = model.get_input_embeddings()
-    input_embeddings.weight.requires_grad = True
-    input_embeddings.weight.register_hook(gradient_mask_hook)
-    
-    print("[GRPO-1] Hook Registered. Only Action Token Embeddings will update.")
+    trainable = 0
+    for name, param in model.named_parameters():
+        if "visual" in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+            trainable += param.numel()
+            
+    print(f"[GRPO-1] Strategy Applied: Vision Frozen, Full LLM Unfrozen.")
+    print(f"[GRPO-1] Trainable Params: {trainable:,}")
     # =========================================================================
     
-    # 6. Train
-    print("[GRPO-1] Starting Reinforcement Learning...")
-    trainer.train()
+    # 6. Train (With Resume Logic)
+    print("[GRPO-1] Checking for existing checkpoints...")
+    last_checkpoint = get_last_checkpoint(HP.GRPO1_OUTPUT_PATH)
+    
+    if last_checkpoint:
+        print(f"[GRPO-1] Resuming training from checkpoint: {last_checkpoint}")
+        trainer.train(resume_from_checkpoint=True)
+    else:
+        print("[GRPO-1] No checkpoint found. Starting fresh training...")
+        trainer.train()
     
     # 7. Save
-    print(f"[GRPO-1] Saving model to {HP.GRPO1_OUTPUT_PATH}")
+    print(f"[GRPO-1] Saving final model to {HP.GRPO1_OUTPUT_PATH}")
     trainer.save_model(HP.GRPO1_OUTPUT_PATH)
     processor.save_pretrained(HP.GRPO1_OUTPUT_PATH)

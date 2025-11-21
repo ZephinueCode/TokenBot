@@ -14,7 +14,7 @@ from ..utils.prompts import AGENT_SYSTEM_PROMPT
 from ..utils.action import ACTION_TOKENS
 
 # =============================================================================
-# DATA STRUCTURES
+# DATA STRUCTURES (Unchanged)
 # =============================================================================
 
 class ToolData:
@@ -42,7 +42,6 @@ class GTTrajectory:
         for item in gt_data:
             img_data = item['image']
             
-            # Handle HF Dataset Serialization (bytes -> PIL) or NumPy
             if isinstance(img_data, dict):
                 if 'bytes' in img_data and img_data['bytes'] is not None:
                     image = Image.open(BytesIO(img_data['bytes'])).convert("RGB")
@@ -78,7 +77,7 @@ class AgentTrajectory:
         self.global_question = input_text
         
         # --- Task Info ---
-        self.total_gt_steps = total_gt_steps # [NEW] Store total steps for reward calc
+        self.total_gt_steps = total_gt_steps 
         
         # --- State ---
         self.current_gt_step_idx = 0
@@ -155,10 +154,23 @@ class Runner:
     def __init__(self):
         print(f"[Runner] Initialized. CoT & Dynamic Constraint Enabled.")
 
-    def check_hit(self, cursor_pos, bbox):
-        """Checks if the cursor position hits the target bounding box."""
+    def check_hit(self, cursor_pos, bbox, img_size):
+        """
+        Checks if the cursor position hits the target bounding box.
+        [FIX]: Automatically scales normalized BBox (0.0-1.0) to absolute pixels.
+        """
         cx, cy = cursor_pos
+        w, h = img_size
         x1, y1, x2, y2 = bbox
+        
+        # [Fix] Detect if bbox is normalized (all coordinates <= 1.0)
+        # If so, scale up by image dimensions
+        if all(0.0 <= c <= 1.0 for c in [x1, y1, x2, y2]):
+            x1 *= w
+            x2 *= w
+            y1 *= h
+            y2 *= h
+
         return (x1 <= cx <= x2) and (y1 <= cy <= y2)
 
     def run_trajectory(
@@ -174,7 +186,7 @@ class Runner:
         # 1. Initialize State
         gt_traj = GTTrajectory(ground_truth_data)
         
-        # [UPDATED] Pass total_gt_steps to AgentTrajectory
+        # Pass total_gt_steps to AgentTrajectory
         agent_traj = AgentTrajectory(
             input_text, 
             gt_traj.get_step(0), 
@@ -191,153 +203,158 @@ class Runner:
         all_logprobs = []
 
         # === ACTION LOOP ===
-        for step in range(max_steps):
-            agent_traj.step_count += 1
-            current_gt = gt_traj.get_step(agent_traj.current_gt_step_idx)
-            curr_img = agent_traj.get_current_view()
+        try: # Global try-block for CUDA OOM protection
+            for step in range(max_steps):
+                agent_traj.step_count += 1
+                current_gt = gt_traj.get_step(agent_traj.current_gt_step_idx)
+                curr_img = agent_traj.get_current_view()
 
-            # Build Prompt
-            messages = [
-                {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": curr_img},
-                        {"type": "text", "text": f"[Action] {agent_traj.global_question}\n"}
-                    ]
-                }
-            ]
-            
-            if agent_traj.tools:
-                 hist_str = "\nAction History:\n" + "\n".join([f"- {t}" for t in agent_traj.tools])
-                 messages[1]["content"].append({"type": "text", "text": hist_str})
+                # Build Prompt
+                messages = [
+                    {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": curr_img},
+                            {"type": "text", "text": f"[Action] {agent_traj.global_question}\n"}
+                        ]
+                    }
+                ]
 
-            text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(
-                text=[text_prompt],
-                images=[curr_img],
-                padding=True,
-                return_tensors="pt"
-            ).to(model.device)
-            
-            # Generate
-            input_ids = inputs.input_ids
-            attention_mask = inputs.attention_mask
-            pixel_values = inputs.pixel_values
-            image_grid_thw = inputs.image_grid_thw
-            
-            generated_text = ""
-            final_action_token = None
-            final_action_logprob = 0.0
-            final_action_id = None 
-            
-            MAX_NEW_TOKENS = 512
-            
-            with torch.no_grad():
-                for gen_i in range(MAX_NEW_TOKENS):
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        pixel_values=pixel_values,
-                        image_grid_thw=image_grid_thw
-                    )
-                    logits = outputs.logits[0, -1, :]
-                    
-                    # Constraint: Force Action token after "Action: "
-                    if "Action: " in generated_text:
-                        mask = torch.full_like(logits, -1e9)
-                        for allow_id in allowed_ids_set:
-                            if allow_id < len(logits):
-                                mask[allow_id] = 0.0
-                        logits = logits + mask
-                    
-                    # Sampling
-                    if temperature == 0.0:
-                        next_token_id = torch.argmax(logits).item()
+                text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = processor(
+                    text=[text_prompt],
+                    images=[curr_img],
+                    padding=True,
+                    return_tensors="pt"
+                ).to(model.device)
+                
+                # Generate
+                input_ids = inputs.input_ids
+                attention_mask = inputs.attention_mask
+                pixel_values = inputs.pixel_values
+                image_grid_thw = inputs.image_grid_thw
+                
+                generated_text = ""
+                final_action_token = None
+                final_action_logprob = 0.0
+                final_action_id = None 
+                
+                MAX_NEW_TOKENS = 512
+                
+                with torch.no_grad():
+                    for gen_i in range(MAX_NEW_TOKENS):
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            pixel_values=pixel_values,
+                            image_grid_thw=image_grid_thw
+                        )
+                        logits = outputs.logits[0, -1, :]
+                        
+                        # Constraint
+                        if "Action: " in generated_text:
+                            mask = torch.full_like(logits, -1e9)
+                            for allow_id in allowed_ids_set:
+                                if allow_id < len(logits):
+                                    mask[allow_id] = 0.0
+                            logits = logits + mask
+                        
+                        # Sampling
+                        if temperature == 0.0:
+                            next_token_id = torch.argmax(logits).item()
+                        else:
+                            scaled_logits = logits / temperature
+                            probs = torch.softmax(scaled_logits, dim=-1)
+                            next_token_id = torch.multinomial(probs, 1).item()
+                        
+                        step_logprob = torch.log_softmax(logits, dim=-1)[next_token_id].item()
+
+                        input_ids = torch.cat([input_ids, torch.tensor([[next_token_id]], device=model.device)], dim=1)
+                        attention_mask = torch.cat([attention_mask, torch.tensor([[1]], device=model.device)], dim=1)
+                        
+                        next_token_text = processor.decode([next_token_id], skip_special_tokens=False)
+                        generated_text += next_token_text
+                        
+                        if next_token_text in ACTION_TOKENS:
+                            final_action_token = next_token_text
+                            final_action_logprob = step_logprob
+                            final_action_id = next_token_id
+                            break 
+                        
+                        if next_token_text in ["<|im_end|>", "<|endoftext|>"]:
+                            break
+
+                # Parse
+                parts = generated_text.split("Action:")
+                reasoning_str = parts[0].replace("Reasoning:", "").strip()
+                
+                print(f"\n[Step {step+1}]")
+                print(f"  Thinking: {reasoning_str[:100]}...")
+                
+                if final_action_token:
+                    print(f"  Action:   {final_action_token}")
+                    clean_gen_text = generated_text.strip()
+                    agent_traj.tools.append(clean_gen_text)
+                    all_token_ids.append(final_action_id) 
+                    all_logprobs.append(final_action_logprob)
+                    token_text = final_action_token
+                else:
+                    print(f"  Action:   [FAILED] {generated_text[-20:]}")
+                    agent_traj.failed = 1 
+                    agent_traj.tools.append("INVALID")
+                    all_token_ids.append(0)
+                    all_logprobs.append(-100.0)
+                    break
+                
+                # Execute
+                token_action_type = get_action_type(token_text)
+                
+                if token_action_type == "move":
+                    if token_text in MOVE_DELTAS:
+                        dx, dy = MOVE_DELTAS[token_text]
+                        agent_traj.move_cursor(dx, dy)
                     else:
-                        scaled_logits = logits / temperature
-                        probs = torch.softmax(scaled_logits, dim=-1)
-                        next_token_id = torch.multinomial(probs, 1).item()
+                        agent_traj.failed = 1; break
+                
+                elif token_action_type in ["click", "scroll", "text", "nav"]:
+                    if token_action_type != current_gt.action_type:
+                        agent_traj.failed = 2; break
                     
-                    step_logprob = torch.log_softmax(logits, dim=-1)[next_token_id].item()
-
-                    input_ids = torch.cat([input_ids, torch.tensor([[next_token_id]], device=model.device)], dim=1)
-                    attention_mask = torch.cat([attention_mask, torch.tensor([[1]], device=model.device)], dim=1)
-                    
-                    next_token_text = processor.decode([next_token_id], skip_special_tokens=False)
-                    generated_text += next_token_text
-                    
-                    if next_token_text in ACTION_TOKENS:
-                        final_action_token = next_token_text
-                        final_action_logprob = step_logprob
-                        final_action_id = next_token_id
-                        break 
-                    
-                    if next_token_text in ["<|im_end|>", "<|endoftext|>"]:
-                        break
-
-            # Parse
-            parts = generated_text.split("Action:")
-            reasoning_str = parts[0].replace("Reasoning:", "").strip()
-            
-            print(f"\n[Step {step+1}]")
-            print(f"  Thinking: {reasoning_str[:100]}...")
-            
-            if final_action_token:
-                print(f"  Action:   {final_action_token}")
-                clean_gen_text = generated_text.strip()
-                agent_traj.tools.append(clean_gen_text)
-                all_token_ids.append(final_action_id) 
-                all_logprobs.append(final_action_logprob)
-                token_text = final_action_token
-            else:
-                print(f"  Action:   [FAILED] {generated_text[-20:]}")
-                agent_traj.failed = 1 
-                agent_traj.tools.append("INVALID")
-                all_token_ids.append(0)
-                all_logprobs.append(-100.0)
-                break
-            
-            # Execute
-            token_action_type = get_action_type(token_text)
-            
-            if token_action_type == "move":
-                if token_text in MOVE_DELTAS:
-                    dx, dy = MOVE_DELTAS[token_text]
-                    agent_traj.move_cursor(dx, dy)
+                    # [FIX]: Pass image size for auto-scaling normalized bbox
+                    if self.check_hit(agent_traj.cursor_pos, current_gt.bbox, curr_img.size):
+                        print("    -> Hit! Target reached.")
+                        if agent_traj.current_gt_step_idx < gt_traj.total_steps - 1:
+                            next_step = gt_traj.get_step(agent_traj.current_gt_step_idx + 1)
+                            agent_traj.advance_to_next_gt_step(next_step)
+                        else:
+                            agent_traj.current_gt_step_idx += 1
+                            agent_traj.gt_steps_passed += 1
+                            print("    -> Task Success (Action Hit).")
+                            agent_traj.failed = 0 
+                            break 
+                    else:
+                        print("    -> Miss! Position off.")
+                        agent_traj.failed = 3; break
+                
+                elif token_action_type == "end":
+                    if agent_traj.current_gt_step_idx >= gt_traj.total_steps:
+                        print("    -> Task Success.")
+                        agent_traj.failed = 0
+                    else:
+                        print("    -> Premature Stop.")
+                        agent_traj.failed = 4
+                    break
                 else:
                     agent_traj.failed = 1; break
-            
-            elif token_action_type in ["click", "scroll", "text", "nav"]:
-                if token_action_type != current_gt.action_type:
-                    agent_traj.failed = 2; break
-                
-                if self.check_hit(agent_traj.cursor_pos, current_gt.bbox):
-                    print("    -> Hit! Target reached.")
-                    if agent_traj.current_gt_step_idx < gt_traj.total_steps - 1:
-                        next_step = gt_traj.get_step(agent_traj.current_gt_step_idx + 1)
-                        agent_traj.advance_to_next_gt_step(next_step)
-                    else:
-                        agent_traj.current_gt_step_idx += 1
-                        agent_traj.gt_steps_passed += 1
-                        print("    -> Task Success (Action Hit).")
-                        agent_traj.failed = 0 
-                        break 
-                else:
-                    print("    -> Miss! Position off.")
-                    agent_traj.failed = 3; break
-            
-            elif token_action_type == "end":
-                if agent_traj.current_gt_step_idx >= gt_traj.total_steps:
-                    print("    -> Task Success.")
-                    agent_traj.failed = 0
-                else:
-                    print("    -> Premature Stop.")
-                    agent_traj.failed = 4
-                break
-            else:
-                agent_traj.failed = 1; break
         
+        except BaseException:
+            print("\n[Runner] Exception! Aborting trajectory safely.")
+            torch.cuda.empty_cache()
+            agent_traj.failed = 4 
+            if len(all_token_ids) < len(agent_traj.tools):
+                 pass
+
         # Timeout Logic
         if agent_traj.failed == 0 and agent_traj.step_count >= max_steps:
              if agent_traj.current_gt_step_idx < gt_traj.total_steps:
@@ -349,19 +366,27 @@ class Runner:
         try:
             os.makedirs("./results", exist_ok=True)
             base_clean = gt_traj.get_step(0).image
-            current_target_bbox = agent_traj.target_bbox
+            
+            # Handle BBox for visualization (also check scaling)
+            viz_bbox = agent_traj.target_bbox
+            w, h = base_clean.size
+            if viz_bbox and all(0.0 <= c <= 1.0 for c in viz_bbox):
+                viz_bbox = [viz_bbox[0]*w, viz_bbox[1]*h, viz_bbox[2]*w, viz_bbox[3]*h]
+
             is_success = (agent_traj.failed == 0)
             
             vis_img = visualize_trajectory(
                 base_image=base_clean,
                 cursor_path=agent_traj.cursor_path,
                 actions=agent_traj.tools,
-                gt_bbox=current_target_bbox,
+                gt_bbox=viz_bbox, # Use scaled bbox
                 success=is_success,
-                instruction=agent_traj.global_question  # Pass instruction
+                instruction=agent_traj.global_question
             )
             vis_img.save("./results/current.png")
         except Exception as e:
             print(f"[Runner] Monitor visualization failed: {e}")
+        
+        torch.cuda.empty_cache()
 
         return agent_traj, all_token_ids, all_logprobs

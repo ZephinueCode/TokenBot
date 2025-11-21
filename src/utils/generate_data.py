@@ -110,9 +110,24 @@ def generate_explanation_sample(token):
         dist = parts[2].replace(">", "").lower()
         definition = f"It moves the cursor {direction} by a {dist} distance."
     elif "CLICK" in token:
-        definition = "It performs a click interaction."
+        definition = random.choice(("It performs a click interaction.", "It means to click the current position."))
+    elif "SCROLL" in token:
+        if "UP" in token: definition = random.choice(("It is a control token. It means to scroll up.", "It means scrolling up at the current position."))
+        elif "DOWN" in token: definition = random.choice(("It is a control token. It means to scroll down.", "It means scrolling down at the current position."))
+        elif "LEFT" in token:
+            definition = random.choice(("It is a control token. It means to scroll left.", "It means scrolling left at the current position."))
+        elif "RIGHT" in token:
+            definition = random.choice(("It is a control token. It means to scroll right.", "It means scrolling right at the current position."))
+    elif "GO_BACK" in token:
+        definition = random.choice(("It navigates back to the previous view.", "It means getting back to the previous page."))
+    elif "GO_HOME" in token:
+        definition = random.choice(("It navigates to the app's home screen.", "It means using the home button."))
+    elif "TEXT"  in token:
+        definition = "It indicates a sequence of user text input, typically wrapped with start/end text tokens."
+    elif "END" in token:
+        definition = random.choice(("It marks the end of an action sequence or session.", "It means stopping the action here."))
     else:
-        definition = "It is a control token."
+        definition = "It is a control token corresponding to a UI operation."
     
     reasoning = f"Reasoning: The user is asking for the definition of the token {token}. I will provide its functional description."
     return question, reasoning, definition
