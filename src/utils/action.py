@@ -45,8 +45,8 @@ ACTION_BASE_EMBEDDING = {
     # ===========================
     # Navigation (System)
     # ===========================
-    "<GO_BACK>": ["go", "back", "return", "previous", "history"],
-    "<GO_HOME>": ["go", "home", "main", "menu", "start"],
+    "<GO_BACK>": ["back", "return", "previous"],
+    "<GO_HOME>": ["home", "main", "start", "desktop"],
 
     # ===========================
     # Scrolling

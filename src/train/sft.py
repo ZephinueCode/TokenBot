@@ -23,12 +23,12 @@ from ..utils.action import ACTION_TOKENS
 from ..utils.prompts import AGENT_SYSTEM_PROMPT
 
 # =============================================================================
-# 0. Custom Trainer for Action Reweighting (FIXED)
+# 0. Custom Trainer for Action Reweighting
 # =============================================================================
 
 class WeightedActionTrainer(Trainer):
     """
-    Applies 20x weight to the Action Token.
+    Applies 30x weight to the Action Token.
     Crucially ignores <|im_end|> and Newlines to focus on the Action.
     """
     def __init__(self, *args, **kwargs):
@@ -67,7 +67,7 @@ class WeightedActionTrainer(Trainer):
         raw_loss = raw_loss.view(batch_size, -1)
 
         weights = torch.ones_like(raw_loss)
-        ACTION_WEIGHT = 30.0
+        ACTION_WEIGHT = 40.0
 
         for i in range(batch_size):
             valid_mask = (shift_labels[i] != -100)
@@ -105,7 +105,7 @@ class WeightedActionTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 # =============================================================================
-# 1. Semantic Grid & Logic
+# 1. Semantic Grid & Logic (UPDATED CoT)
 # =============================================================================
 
 def get_grid_region(x: int, y: int, width: int, height: int) -> str:
@@ -123,9 +123,9 @@ def get_grid_region(x: int, y: int, width: int, height: int) -> str:
 def get_spatial_label_with_cot(cursor_pos, target_center, intent):
     """
     Generates reasoning + Special Token Action.
-    Ends exactly with the Action Token.
+    Now includes relative coordinates and directional prioritization logic.
     """
-    # === Navigation Logic ===
+    # === Navigation Logic (No Coordinates needed usually) ===
     if intent["type"] == "nav":
         mode = intent["mode"] # 'back' or 'home'
         reasoning = "Reasoning: "
@@ -154,40 +154,36 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
     t_region = get_grid_region(tx, ty, HP.IMAGE_SIZE, HP.IMAGE_SIZE)
     target_name = intent.get('name', 'target')
     
+    # 1. Basic Region Description
     reasoning = "Reasoning: "
     reasoning += f"The cursor is currently in the **{c_region}** region. "
     reasoning += f"The target '{target_name}' is located in the **{t_region}** region. "
 
-    # === [NEW] Relative Position Logic ===
+    # 2. [NEW] Relative Coordinates
+    # Calculate relative position (0.0 - 1.0)
+    rel_cx, rel_cy = round(cx / HP.IMAGE_SIZE, 1), round(cy / HP.IMAGE_SIZE, 1)
+    rel_tx, rel_ty = round(tx / HP.IMAGE_SIZE, 1), round(ty / HP.IMAGE_SIZE, 1)
+    
+    # 3. Relative Position Logic
     if c_region == t_region:
         reasoning += f"I need to examine the position more carefully. "
+        reasoning += f"The cursor is at about [{rel_cx:.1f}, {rel_cy:.1f}] and the target is at about [{rel_tx:.1f}, {rel_ty:.1f}] (relative coordinates) of the image. "
     
-    dx = tx - cx
-    dy = ty - cy
     margin = 15
-    
     v_rel = ""
     h_rel = ""
 
-    if dy < -margin:
-        v_rel = "Top"
-    elif dy > margin:
-        v_rel = "Bottom"
+    if dy < -margin: v_rel = "Top"
+    elif dy > margin: v_rel = "Bottom"
     
-    if dx < -margin:
-        h_rel = "Left"
-    elif dx > margin:
-        h_rel = "Right"
+    if dx < -margin: h_rel = "Left"
+    elif dx > margin: h_rel = "Right"
     
     rel_pos_str = ""
-    if v_rel and h_rel:
-        rel_pos_str = f"{v_rel}-{h_rel}"  # Top-Left, Bottom-Right
-    elif v_rel:
-        rel_pos_str = v_rel               # Top
-    elif h_rel:
-        rel_pos_str = h_rel               # Right
-    else:
-        rel_pos_str = "Overlapping"
+    if v_rel and h_rel: rel_pos_str = f"{v_rel}-{h_rel}"
+    elif v_rel: rel_pos_str = v_rel
+    elif h_rel: rel_pos_str = h_rel
+    else: rel_pos_str = "Overlapping"
 
     if rel_pos_str != "Overlapping":
         reasoning += f"The target is to the **{rel_pos_str}** of the cursor. "
@@ -197,6 +193,7 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
     HIT_THRESHOLD = 15
     action = ""
     
+    # === Decision: Click vs Move ===
     if dist < HIT_THRESHOLD:
         reasoning += f"The cursor is currently positioned **over** the target '{target_name}'. "
         if intent["type"] == "click":
@@ -224,8 +221,12 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
             
         reasoning += f"The target is {' '.join(dir_desc)} of the cursor. "
         
+        # 4. [NEW] Direction Prioritization Logic
+        # Compare horizontal vs vertical gap to decide main direction
         if abs(dx) > abs(dy):
             direction = "RIGHT" if dx > 0 else "LEFT"
+            reasoning += f"Currently the **{direction}** direction is the farthest away. "
+            
             d_val = abs(dx)
             suffix = "FAR" if d_val > 300 else ("MID" if d_val > 100 else "CLO")
             
@@ -236,6 +237,8 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
             action = f"<MOVE_{direction}_{suffix}>"
         else:
             direction = "DOWN" if dy > 0 else "UP"
+            reasoning += f"Currently the **{direction}** direction is the farthest away. "
+            
             d_val = abs(dy)
             suffix = "FAR" if d_val > 300 else ("MID" if d_val > 100 else "CLO")
             
@@ -248,7 +251,7 @@ def get_spatial_label_with_cot(cursor_pos, target_center, intent):
     return f"{reasoning}\nAction: {action}"
 
 # =============================================================================
-# 2. Dataset (MODIFIED: 5:3:2 Split + Prompt Diversity)
+# 2. Dataset
 # =============================================================================
 class SFTDataset(Dataset):
     def __init__(self, data_path):
@@ -271,7 +274,6 @@ class SFTDataset(Dataset):
         self.ui_names = ["Submit", "Cancel", "Search", "Menu", "Settings", "Back", "Profile", "Login", "Options", "Button", "Application", "Game", "Function"]
         self.text_contents = ["hello", "test", "123456", "user", "admin"]
         
-        # [NEW] Diverse Prompt Templates for better generalization
         self.prompts_click = [
             "Click {name}", "Select {name}", "Tap on {name}", "Hit the {name} button", "Choose {name}"
         ]
@@ -325,7 +327,7 @@ class SFTDataset(Dataset):
             msgs = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + item["messages"]
             return {"messages": msgs, "image": image}
 
-        # === TYPE 2: SPATIAL & NAVIGATION (Synthetic) - 5:3:2 Split ===
+        # === TYPE 2: SPATIAL & NAVIGATION (Synthetic) ===
         else:
             image = self.get_random_background()
             draw = ImageDraw.Draw(image)
@@ -337,19 +339,13 @@ class SFTDataset(Dataset):
             ty = random.randint(margin, HP.IMAGE_SIZE - margin)
             target_name = random.choice(self.ui_names)
             
-            # ----------------------------------------------------------
-            # CASE A: Moving (70%) - Force <MOVE>
-            # Cursor: FAR from target (>50px)
-            # Intent: Random (User wants Click/Move/Text, but needs to move first)
-            # ----------------------------------------------------------
+            # CASE A: Moving (70%)
             if sample_rng < 0.7:
-                # Ensure cursor is far enough
                 while True:
                     cx = random.randint(margin, HP.IMAGE_SIZE - margin)
                     cy = random.randint(margin, HP.IMAGE_SIZE - margin)
                     if math.hypot(cx-tx, cy-ty) > 50: break
                 
-                # Intent can be varied, instructions reflect user goal
                 sub_type = random.choice(["click", "move", "text"])
                 if sub_type == "click":
                     intent = {"type": "click", "name": target_name}
@@ -364,61 +360,48 @@ class SFTDataset(Dataset):
                 
                 instr = instr_tmpl.format(name=target_name, content=intent.get("content", ""))
 
-            # ----------------------------------------------------------
-            # CASE B: Direct Clicking (15%) - Force <CLICK>
-            # Cursor: ON target (<15px), may require slight adjustments.
-            # Intent: Click
-            # ----------------------------------------------------------
+            # CASE B: Direct Clicking (15%)
             elif sample_rng < 0.85:
                 cx = tx + random.randint(-20, 20)
                 cy = ty + random.randint(-20, 20)
                 intent = {"type": "click", "name": target_name}
                 instr = random.choice(self.prompts_click).format(name=target_name)
 
-            # ----------------------------------------------------------
-            # CASE C: Other Tasks (15%) - Text & Nav
-            # ----------------------------------------------------------
+            # CASE C: Other Tasks (15%)
             else:
-                # Split 50/50 between Text (Ready) and Nav
                 if random.random() < 0.5:
-                    # Text Ready (Cursor ON target)
+                    # Text Ready
                     cx = tx + random.randint(-10, 10)
                     cy = ty + random.randint(-10, 10)
                     content = random.choice(self.text_contents)
                     intent = {"type": "text", "name": target_name, "content": content}
                     instr = random.choice(self.prompts_text).format(name=target_name, content=content)
                 else:
-                    # Navigation (Cursor random, Target irrelevant/invisible)
+                    # Navigation
                     intent_mode = random.choice(["back", "home"])
                     intent = {"type": "nav", "mode": intent_mode, "name": "System"}
                     cx = random.randint(margin, HP.IMAGE_SIZE - margin)
                     cy = random.randint(margin, HP.IMAGE_SIZE - margin)
-                    tx, ty = 0, 0 # Hide target
+                    tx, ty = 0, 0
                     
-                    if intent_mode == "back":
-                        instr = random.choice(self.prompts_back)
-                    else:
-                        instr = random.choice(self.prompts_home)
+                    if intent_mode == "back": instr = random.choice(self.prompts_back)
+                    else: instr = random.choice(self.prompts_home)
 
-            # --- Drawing Logic ---
-            # Only draw target for non-Nav tasks
+            # Draw
             if intent.get("type") != "nav":
                 draw.rectangle([tx-30, ty-20, tx+30, ty+20], outline=random.choice(("green","black","blue","yellow","red")), width=3)
                 try: draw.text((tx-20, ty-35), target_name, fill=random.choice(("green","black","blue","yellow","red")))
                 except: pass
 
-            # Draw Distractors (Noise)
             for _ in range(random.randint(2, 5)):
-                dx = random.randint(margin, HP.IMAGE_SIZE - margin)
-                dy = random.randint(margin, HP.IMAGE_SIZE - margin)
-                if abs(dx - tx) > 60 or abs(dy - ty) > 60:
-                    draw.rectangle([dx-30, dy-20, dx+30, dy+20], outline=random.choice(("green","black","blue","yellow","red")), width=3)
+                dx_rand = random.randint(margin, HP.IMAGE_SIZE - margin)
+                dy_rand = random.randint(margin, HP.IMAGE_SIZE - margin)
+                if abs(dx_rand - tx) > 60 or abs(dy_rand - ty) > 60:
+                    draw.rectangle([dx_rand-30, dy_rand-20, dx_rand+30, dy_rand+20], outline=random.choice(("green","black","blue","yellow","red")), width=3)
 
-            # Draw Cursor
             from ..tools.visual_utils import draw_cursor
             image = draw_cursor(image, cx, cy)
 
-            # Generate Label
             cot_response = get_spatial_label_with_cot((cx, cy), (tx, ty), intent)
             
             msgs = [
@@ -430,7 +413,7 @@ class SFTDataset(Dataset):
             return {"messages": msgs, "image": image}
 
 # =============================================================================
-# 3. Collator (Unchanged)
+# 3. Collator
 # =============================================================================
 @dataclass
 class SFTDataCollator:
@@ -494,7 +477,6 @@ class SFTDataCollator:
 def setup_model_for_sft(model, processor):
     print("[Model Setup] Configuring Surgical Fine-Tuning strategy...")
 
-    # 1. Identify Target Token IDs (Special Tokens)
     action_token_ids = [
         processor.tokenizer.convert_tokens_to_ids(t) 
         for t in ACTION_TOKENS
@@ -503,29 +485,22 @@ def setup_model_for_sft(model, processor):
     
     print(f"[Model Setup] Targeted Special Tokens: {len(action_token_ids)} tokens")
     
-    target_indices_tensor = torch.tensor(action_token_ids)
-
-    # 2. Enable Gradients for Embeddings
     model.enable_input_require_grads() 
     input_embeddings = model.get_input_embeddings()
     input_embeddings.weight.requires_grad = True
 
-    # 4. Configure Freezing
     trainable_params = 0
     total_params = 0
     
     for name, param in model.named_parameters():
         total_params += param.numel()
-        
-        # === Vision Module Handling ===
         if "visual" in name:
             param.requires_grad = False
         elif "embed_tokens" in name or "wte" in name:
-            # Physically unfrozen, but logically restricted by hook
             param.requires_grad = True
             trainable_params += param.numel()
         else:
-            param.requires_grad = True # Train LLM for Reasoning
+            param.requires_grad = True 
             trainable_params += param.numel()
 
     print(f"[Model Setup] Total Params: {total_params:,}")
@@ -558,7 +533,6 @@ def run_sft():
         warmup_ratio=0.1
     )
     
-    # Use Custom Weighted Trainer instead of Standard Trainer
     trainer = WeightedActionTrainer(
         model=model, 
         args=args, 

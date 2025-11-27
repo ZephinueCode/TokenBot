@@ -77,7 +77,7 @@ def get_shortest_path_actions(start_pos: Tuple[int, int], target_pos: Tuple[int,
         dist = math.hypot(tx - cx, ty - cy)
         
         # Click threshold (approx 20px radius)
-        if dist <= 30: 
+        if dist <= 20: 
             break
             
         best_move_token = None

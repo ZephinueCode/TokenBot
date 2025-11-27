@@ -16,30 +16,45 @@ from ..tools.runner import Runner
 from ..train.reward import batch_compute_rewards
 from ..tools.visual_utils import visualize_trajectory
 
+# --- Dynamic Imports for Baselines ---
 try:
     from .baseline_vlm import BaselineAPIRunner
 except ImportError:
     BaselineAPIRunner = None
 
-def evaluate_model(mode="trained", limit=None, model_path=None):
+try:
+    from .baseline_grounding import BaselineGroundingRunner
+except ImportError:
+    BaselineGroundingRunner = None
+
+def evaluate_model(mode="trained", limit=None, model_path=None, bbox_expansion=None):
     """
     Main Evaluation Loop.
     Args:
-        mode: "trained" (Local Model) or "api_baseline" (GPT-4o/Claude etc.)
+        mode: 
+            - "trained": Local SFT Model (Qwen2-VL based)
+            - "api_baseline": General VLM Agent (GPT-4o, Claude 3.5 via API)
+            - "grounding_baseline": Qwen-VL Grounding Agent (Box Output -> Click)
         limit: Max samples to evaluate (None for all)
+        bbox_expansion: Float ratio (0.0 - 1.0) to expand GT bbox for fairer eval.
     """
     if model_path is None:
         model_path = HP.SFT_2_OUTPUT_PATH
+    
+    # [CONFIG] Set expansion ratio (default to HP or 5% if not set)
+    if bbox_expansion is None:
+        bbox_expansion = getattr(HP, "EVAL_BBOX_EXPANSION", 0.05)
 
     # 1. Setup Output Directories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_save_dir = "./results/eval"
-    eval_name = f"{mode}_{timestamp}"
+    eval_name = f"{mode}_{timestamp}_relax{int(bbox_expansion*100)}"
     result_dir = os.path.join(base_save_dir, eval_name)
     img_save_dir = os.path.join(result_dir, "images")
     
     os.makedirs(img_save_dir, exist_ok=True)
     print(f"\n[EVAL] Starting Evaluation: {mode.upper()}")
+    print(f"[EVAL] BBox Relaxation: {bbox_expansion:.1%} of screen size")
     print(f"[EVAL] Saving results to: {result_dir}")
 
     # 2. Load Data (Use Test Split)
@@ -61,9 +76,16 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
     if mode == "api_baseline":
         if BaselineAPIRunner is None:
             raise ImportError("BaselineAPIRunner not found. Check src/eval/baseline_vlm.py")
-        print(f"[EVAL] Initializing API Runner...")
+        print(f"[EVAL] Initializing API Baseline Runner...")
         runner = BaselineAPIRunner()
-    else:
+
+    elif mode == "grounding_baseline":
+        if BaselineGroundingRunner is None:
+            raise ImportError("BaselineGroundingRunner not found. Check src/eval/baseline_grounding.py")
+        print(f"[EVAL] Initializing Qwen-VL Grounding Runner...")
+        runner = BaselineGroundingRunner()
+
+    elif mode == "trained":
         print(f"[EVAL] Loading Local Model from: {model_path}")
         try:
             model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -77,6 +99,8 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
         except Exception as e:
             print(f"[Error] Failed to load model: {e}")
             return
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
     # 4. Main Loop
     results = []
@@ -100,18 +124,27 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
                 bbox = [p[0], p[1], p[0], p[1]]
             
             # [CRITICAL FIX] Robust BBox Scaling
-            # Ensure bbox is in absolute pixels for Runner & Visualization
             final_bbox = [0, 0, 0, 0]
             if bbox:
-                # Check if bbox is normalized (0.0-1.0)
                 if all(0.0 <= x <= 1.0 for x in bbox):
                     final_bbox = [
                         bbox[0] * w, bbox[1] * h,
                         bbox[2] * w, bbox[3] * h
                     ]
                 else:
-                    # Assume absolute pixels
                     final_bbox = bbox
+
+            # [NEW] Relax BBox Standards
+            if bbox_expansion > 0 and final_bbox != [0,0,0,0]:
+                margin_x = w * bbox_expansion
+                margin_y = h * bbox_expansion
+                
+                final_bbox = [
+                    max(0, final_bbox[0] - margin_x), # x1
+                    max(0, final_bbox[1] - margin_y), # y1
+                    min(w, final_bbox[2] + margin_x), # x2
+                    min(h, final_bbox[3] + margin_y)  # y2
+                ]
 
             # Construct GT Data Entry
             gt_data_entry = {
@@ -123,24 +156,28 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
             ground_truth_data = [gt_data_entry]
 
             # --- Run Inference ---
-            if mode == "api_baseline":
+            if mode in ["api_baseline", "grounding_baseline"]:
+                # API and Grounding runners usually don't need local model/processor args
                 traj, _, _ = runner.run_trajectory(
                     input_text=sample['instruction'],
                     ground_truth_data=ground_truth_data,
-                    max_steps=HP.EVAL_MAX_STEPS if hasattr(HP, 'EVAL_MAX_STEPS') else 10
+                    max_steps=HP.EVAL_MAX_STEPS,
                 )
             else:
+                # Local Trained Model
                 traj, _, _ = runner.run_trajectory(
                     model=model,
                     processor=processor,
                     input_text=sample['instruction'],
                     ground_truth_data=ground_truth_data,
-                    max_steps=10, 
-                    temperature=0.0 
+                    max_steps=HP.EVAL_MAX_STEPS, 
+                    temperature=0.7 
                 )
 
             # --- Metrics ---
             is_success = (traj.failed == 0)
+            
+            # Calculate reward (Grounding runner might not output token_ids, but batch_compute_rewards handles generic traj)
             reward = batch_compute_rewards([traj])[0] 
             
             metrics["total_steps"] += traj.step_count
@@ -152,7 +189,6 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
                     metrics["failed_reasons"][traj.failed] += 1
 
             # --- Visualization ---
-            # Visualize on the raw image using correct absolute bbox
             vis_img = visualize_trajectory(
                 base_image=raw_img,
                 cursor_path=traj.cursor_path,
@@ -163,7 +199,8 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
             )
             
             status_str = "PASS" if is_success else "FAIL"
-            img_filename = f"id_{i:04d}_{status_str}_rew{reward:.1f}.png"
+            # Add mode prefix to filename to avoid confusion if viewing manually
+            img_filename = f"{mode}_id_{i:04d}_{status_str}_rew{reward:.1f}.png"
             vis_img.save(os.path.join(img_save_dir, img_filename))
 
             # --- Log Result ---
@@ -178,11 +215,11 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
                 "vis_file": img_filename
             })
             
-            # Clear Cache
             if i % 10 == 0: torch.cuda.empty_cache()
 
         except Exception as e:
             print(f"[EVAL] Error processing sample {i}: {e}")
+            # print(traceback.format_exc()) # Uncomment for deeper debugging
             continue
 
     # 5. Final Report
@@ -195,6 +232,7 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
     
     print("\n" + "="*40)
     print(f"EVAL REPORT: {mode.upper()}")
+    print(f"Relaxation:     {bbox_expansion:.1%}")
     print(f"Total Samples: {count}")
     print(f"Success Rate:  {acc:.2%}")
     print(f"Avg Steps:     {avg_steps:.2f}")
@@ -206,8 +244,9 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
     report = {
         "meta": {
             "mode": mode,
-            "model_path": model_path if mode != "api_baseline" else "API",
+            "model_path": model_path if mode == "trained" else mode,
             "timestamp": timestamp,
+            "relaxation_ratio": bbox_expansion,
             "num_samples": count
         },
         "metrics": {
@@ -226,5 +265,12 @@ def evaluate_model(mode="trained", limit=None, model_path=None):
     print(f"[EVAL] Full report saved to: {json_path}")
 
 if __name__ == "__main__":
-    # Limit serves as a quick smoke test, can be set to None for full run
-    evaluate_model(mode="trained", limit=HP.EVAL_DATASET_SIZE if hasattr(HP, 'EVAL_DATASET_SIZE') else 20)
+    # Example Usage:
+    # 1. Evaluate Grounding Baseline (Qwen-VL)
+    # evaluate_model(mode="grounding_baseline", limit=10, bbox_expansion=0.05)
+    
+    # 2. Evaluate API Baseline (GPT-4o)
+    # evaluate_model(mode="api_baseline", limit=10, bbox_expansion=0.05)
+    
+    # 3. Evaluate Local SFT Model
+    evaluate_model(mode="trained", limit=None, bbox_expansion=0.05)

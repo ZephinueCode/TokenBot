@@ -1,4 +1,4 @@
-# src/train/sft_screenspot.py
+# src/train/sft2.py
 
 import torch
 import random
@@ -38,31 +38,22 @@ COT_TEMPLATES = {
     
     # 2. Localization (Cursor & Target)
     "localization": [
-        # Style A: Descriptive
         "The cursor is currently in the **{c_region}** region, while the target lies in the **{t_region}** region.",
-        # Style B: Scanning style
         "Scanning screen... Cursor found at **{c_region}**. Target identified at **{t_region}**.",
-        # Style C: Direct comparison
         "Position check: Cursor is at **{c_region}**; Target is at **{t_region}**.",
     ],
     
     # 3. Relative Direction (Movement needed)
     "direction": [
-        # Style A: Relative
         "The target is located to the **{rel_pos}** of the current cursor position.",
-        # Style B: Action-oriented
         "To reach the target, I need to move towards the **{rel_pos}**.",
-        # Style C: Vector observation
         "There is a spatial offset. The target is **{rel_pos}** relative to the cursor.",
     ],
     
     # 4. Arrival (Click needed)
     "arrival": [
-        # Style A
         "The cursor is positioned **over** the target.",
-        # Style B
         "Target acquired. The cursor is aligned with the element.",
-        # Style C
         "Zero distance. The cursor is exactly where it needs to be.",
     ],
     
@@ -111,7 +102,7 @@ def get_grid_region(x: int, y: int, width: int, height: int) -> str:
 
 def generate_cot_for_step(cursor_pos, target_pos, instruction, next_action_token):
     """
-    Generate 'Oracle' Chain-of-Thought with High Entropy (Randomized Templates).
+    Generate 'Oracle' Chain-of-Thought with High Entropy + Precise Coords.
     """
     cx, cy = cursor_pos
     tx, ty = target_pos
@@ -129,6 +120,14 @@ def generate_cot_for_step(cursor_pos, target_pos, instruction, next_action_token
     
     cot = f"{cot_part1}{cot_part2} "
     
+    # --- [NEW] Exact Relative Coordinates ---
+    rel_cx, rel_cy = round(cx / HP.IMAGE_SIZE, 1), round(cy / HP.IMAGE_SIZE, 1)
+    rel_tx, rel_ty = round(tx / HP.IMAGE_SIZE, 1), round(ty / HP.IMAGE_SIZE, 1)
+    
+    if c_region == t_region:
+        cot += f"I need to examine the position more carefully. "
+        cot += f"The cursor is at about [{rel_cx:.1f}, {rel_cy:.1f}] and the target is at about [{rel_tx:.1f}, {rel_ty:.1f}] (relative coordinates) of the image. "
+
     # --- 3. Spatial Logic ---
     dx = tx - cx
     dy = ty - cy
@@ -153,6 +152,14 @@ def generate_cot_for_step(cursor_pos, target_pos, instruction, next_action_token
     else:
         t_arr = random.choice(COT_TEMPLATES["arrival"])
         cot += t_arr + " "
+
+    # --- [NEW] Direction Prioritization (Only for Move) ---
+    if "MOVE" in next_action_token:
+        if abs(dx) > abs(dy):
+            direction = "RIGHT" if dx > 0 else "LEFT"
+        else:
+            direction = "DOWN" if dy > 0 else "UP"
+        cot += f"Currently the **{direction}** direction is the farthest away. "
 
     # --- 5. Action Planning ---
     if "CLICK" in next_action_token:
@@ -352,17 +359,16 @@ class ScreenSpotSFTDataset(Dataset):
         center_x, center_y = HP.IMAGE_SIZE // 2, HP.IMAGE_SIZE // 2
         path = get_shortest_path_actions((center_x, center_y), (tx, ty))
         
-        # 4. Sampling Strategy (Modified)
+        # 4. Sampling Strategy
         if not path:
             current_pos = (center_x, center_y)
             action_token = "<CLICK_SHORT>"
         else:
-            # [MODIFIED] 33% chance to force Final Step (Click) to teach clicking
+            # 33% chance to force Final Step (Click)
             if random.random() < 0.33:
                 step_idx = len(path) - 1
             else:
                 # 67% chance to teach Navigation
-                # If only 1 step exists, we must pick 0
                 if len(path) > 1:
                     step_idx = random.randint(0, len(path) - 2)
                 else:
@@ -429,12 +435,20 @@ def run_sft_screenspot():
         learning_rate=HP.SFT_2_LEARN_RATE,
         bf16=True,
         logging_steps=5,
-        save_strategy="epoch",
-        eval_strategy="epoch",
+        save_strategy="steps",
+        save_safetensors=True,
+        eval_strategy="steps",
+        save_steps=120,
+        eval_steps=120,
         report_to="tensorboard",
         remove_unused_columns=False,
         gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False}
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        
+        save_total_limit=1,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     )
     
     trainer = WeightedActionTrainer(
