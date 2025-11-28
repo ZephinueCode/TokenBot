@@ -11,11 +11,12 @@ from .utils.action import ACTION_BASE_EMBEDDING
 # Import Training Phases
 from .train.sft import run_sft as run_sft_phase1
 from .train.sft2 import run_sft_screenspot as run_sft_phase2
+from .train.sft3 import run_sft_screenspot_pro as run_sft_phase3
 
 if __name__ == "__main__":
     
     # =========================================================================
-    # PHASE 0: Initialization
+    # PHASE 0: Model Initialization
     # =========================================================================
     print("\n" + "="*60)
     print("PHASE 0: Model Initialization")
@@ -51,15 +52,30 @@ if __name__ == "__main__":
         print("[Main] Phase 1 output found. Skipping.")
     
     # =========================================================================
-    # PHASE 2: SFT - Visual Grounding (ScreenSpot Trajectories)
+    # PHASE 2: SFT - Visual Grounding (Legacy ScreenSpot)
     # =========================================================================
     print("\n" + "="*60)
-    print("PHASE 2: SFT - Visual Grounding")
+    print("PHASE 2: SFT - Visual Grounding (Basic)")
     print("Action: Training on ScreenSpot shortest-path trajectories.")
     print("="*60 + "\n")
     
-    run_sft_phase2()
+    if not os.path.exists(HP.SFT_2_OUTPUT_PATH):
+        run_sft_phase2()
+    else:
+        print("[Main] Phase 2 output found. Skipping.")
+
+    # =========================================================================
+    # PHASE 3: SFT - Visual Grounding Pro (ScreenSpot Pro)
+    # =========================================================================
+    print("\n" + "="*60)
+    print("PHASE 3: SFT - Visual Grounding Pro")
+    print("Action: Training on ScreenSpot Pro local dataset.")
+    print("="*60 + "\n")
+
+    # run_sft_phase3()
     
     print("\n" + "="*60)
-    print(f"PIPELINE COMPLETE. Final Model: {HP.SFT_2_OUTPUT_PATH}")
+    # The final model is now the output of Phase 3
+    final_path = getattr(HP, "SFT_3_OUTPUT_PATH", "./checkpoints/sft_phase3")
+    print(f"PIPELINE COMPLETE. Final Model: {final_path}")
     print("="*60 + "\n")

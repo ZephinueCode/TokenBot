@@ -87,9 +87,6 @@ def get_shortest_path_actions(start_pos: Tuple[int, int], target_pos: Tuple[int,
         
         for token, (mv_x, mv_y) in valid_moves:
             nx, ny = cx + mv_x, cy + mv_y
-            # Boundary Check
-            if not (0 <= nx < HP.IMAGE_SIZE and 0 <= ny < HP.IMAGE_SIZE):
-                continue
             
             rem_dist = math.hypot(tx - nx, ty - ny)
             if rem_dist < min_dist_remaining:

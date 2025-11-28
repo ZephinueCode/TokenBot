@@ -37,9 +37,17 @@ class HYPERPARAMS:
     # Remaining 10% is reserved as 'Test' (Raw data)
         
     SFT_2_LEARN_RATE = 1e-5 # Slightly lower LR for Stage 2
-    SFT_2_BATCH_SIZE = 4    # Images are heavy, smaller batch
-    SFT_2_GRAD_ACCUM_STEPS = 4
+    SFT_2_BATCH_SIZE = 1    # Images are heavy, smaller batch
+    SFT_2_GRAD_ACCUM_STEPS = 8
     SFT_2_EPOCHS = 4        # More epochs to learn visual features
+
+    SFT_3_OUTPUT_PATH = "./checkpoints/Qwen3-VL-GUI-SFT-ScreenSpot-Pro"
+    SCREENSPOT_PRO_TOTAL_SIZE = 1800
+
+    SFT_3_LEARN_RATE = 5e-6 # Slightly lower LR for Stage 2
+    SFT_3_BATCH_SIZE = 1    # Images are heavy, smaller batch
+    SFT_3_GRAD_ACCUM_STEPS = 8
+    SFT_3_EPOCHS = 3        # More epochs to learn visual features
     
     # ================= TRAINING PARAMS FOR GRPO1 =================
     # GRPO1 (Easy grounding tasks with ScreenSpot)

@@ -131,32 +131,17 @@ Action: <CLICK_SHORT>
 """
 
 BASELINE_GROUNDING_PROMPT = """
-Use a mouse and keyboard to interact with a computer, and take screenshots.
-* This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.
-* The cursor is a red crosshair on the screen showing your current mouse position. When you wish to click, you should click directly at a correct position.
-* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try wait and taking another screenshot.
-* Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.
-* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.
-* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges.
+You are a helpful assistant.
 
-# AVAILABLE ACTIONS
-You must output your action in JSON format. The available actions and their required parameters are:
+You may call one or more functions to assist with the user query.
 
-* `key`: Performs key down presses. Params: "keys" (array of strings).
-* `type`: Type a string of text. Params: "text" (string).
-* `mouse_move`: Move the cursor. Params: "coordinate" [x, y].
-* `left_click`: Click the left mouse button. Params: "coordinate" [x, y].
-* `left_click_drag`: Click and drag the cursor. Params: "coordinate" [x, y].
-* `right_click`: Click the right mouse button. Params: "coordinate" [x, y].
-* `middle_click`: Click the middle mouse button. Params: "coordinate" [x, y].
-* `double_click`: Double-click the left mouse button. Params: "coordinate" [x, y].
-* `scroll`: Scroll the mouse wheel. Params: "pixels" (number).
-* `wait`: Wait for changes. Params: "time" (number).
-* `terminate`: End the task. Params: "status" ("success" or "failure").
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "computer_use", "description": "Use a mouse to interact with a computer.\n* The screen's resolution is {WIDTH}x{HEIGHT}.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.\n* you can only use the left_click and mouse_move action to interact with the computer. if you can't find the element, you should terminate the task and report the failure.", "parameters": {"properties": {"action": {"description": "The action to perform. The available actions are:\n* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n* `left_click`: Click the left mouse button with coordinate (x, y).\n* `terminate`: Terminate the current task and report its completion status.", "enum": ["mouse_move", "left_click"], "type": "string"}, "coordinate": {"description": "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates to move the mouse to. Required only by `action=mouse_move` and `action=left_click`.", "type": "array"}, "status": {"description": "The status of the task. Required only by `action=terminate`.", "type": "string", "enum": ["success", "failure"]}}, "required": ["action"], "type": "object"}}}
+</tools>
 
-# RESPONSE FORMAT
-You must strictly follow this format:
-
-Reasoning: [Analyze the screenshot. Calculate coordinates explicitly.]
-Action: {"action": "left_click", "coordinate": [x, y]}
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
 """

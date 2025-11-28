@@ -13,7 +13,7 @@ from openai import OpenAI
 from ..utils.parameters import HYPERPARAMS as HP
 from ..tools.runner import Runner, AgentTrajectory, GTTrajectory
 from ..tools.visual_utils import draw_cursor
-from ..utils.prompts import BASELINE_GROUNDING_PROMPT
+from ..utils.prompts import BASELINE_GROUNDING_PROMPT as TOOLS_DEFINITION
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -31,8 +31,8 @@ def encode_image_to_base64(image: Image.Image) -> str:
 
 class BaselineGroundingRunner(Runner):
     """
-    A baseline agent that follows the 'Computer Use' JSON prompt format.
-    It parses JSON actions (e.g., {"action": "left_click", "coordinate": [x, y]}).
+    A baseline agent that follows the 'Computer Use' XML/JSON prompt format.
+    It forces the input image to 1000x1000 and maps coordinates back to original size.
     """
 
     def __init__(self):
@@ -48,52 +48,33 @@ class BaselineGroundingRunner(Runner):
     def parse_response(self, content: str) -> Tuple[str, str, Dict[str, Any]]:
         """
         Parses response format:
-        Reasoning: ...
-        Action: ```json {...} ``` or just {...}
-        
-        Returns: (reasoning, action_name, params_dict)
+        <tool_call>
+        {"name": "computer_use", "arguments": {"action": "...", "coordinate": [x, y]}}
+        </tool_call>
         """
         content = content.strip()
-        reasoning = ""
-        action_json_str = ""
+        reasoning = content 
+        action_type = None
+        arguments = {}
 
-        # 1. Split Reasoning and Action
-        if "Action:" in content:
-            parts = content.split("Action:")
-            reasoning = parts[0].replace("Reasoning:", "").strip()
-            action_json_str = parts[1].strip()
-        else:
-            # Fallback: try to find the last JSON block
-            reasoning = content
-            action_json_str = content
-
-        # 2. Extract JSON string
-        # Handle markdown code blocks if present
-        if "```json" in action_json_str:
-            match = re.search(r"```json(.*?)```", action_json_str, re.DOTALL)
-            if match:
-                action_json_str = match.group(1).strip()
-        elif "```" in action_json_str:
-             match = re.search(r"```(.*?)```", action_json_str, re.DOTALL)
-             if match:
-                action_json_str = match.group(1).strip()
-
-        # 3. Parse JSON
-        try:
-            # Clean up potentially messy string
-            action_json_str = action_json_str.strip()
-            data = json.loads(action_json_str)
+        # 1. Regex to find <tool_call> content
+        match = re.search(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL)
+        
+        if match:
+            reasoning = content[:match.start()].strip()
+            json_str = match.group(1).strip()
             
-            if isinstance(data, dict) and "action" in data:
-                action_name = data["action"]
-                # Remove 'action' key to return the rest as parameters
-                params = {k: v for k, v in data.items() if k != "action"}
-                return reasoning, action_name, params
-                
-        except json.JSONDecodeError:
-            pass
-            
-        return reasoning, None, {}
+            try:
+                data = json.loads(json_str)
+                if data.get("name") == "computer_use":
+                    args = data.get("arguments", {})
+                    action_type = args.get("action")
+                    arguments = args
+                    
+            except json.JSONDecodeError:
+                print(f"[Parse Error] Invalid JSON in tool_call: {json_str}")
+
+        return reasoning, action_type, arguments
 
     def run_trajectory(
         self,
@@ -105,7 +86,6 @@ class BaselineGroundingRunner(Runner):
         # 1. Init State
         gt_traj = GTTrajectory(ground_truth_data)
         
-        # [Guard] Check for empty GT
         if gt_traj.total_steps == 0:
             print("[Error] Ground Truth data is empty.")
             dummy = AgentTrajectory(input_text, None, 0)
@@ -120,36 +100,35 @@ class BaselineGroundingRunner(Runner):
         for step in range(max_steps):
             agent_traj.step_count += 1
             
-            # [Guard] Safe GT retrieval
             current_gt = gt_traj.get_step(agent_traj.current_gt_step_idx)
             if current_gt is None:
                 print(" -> [Fail] GT Index out of bounds.")
                 agent_traj.failed = 4
                 break
 
-            # 2. Prepare View and Resolution
+            # 2. Prepare View (Resize to 1000x1000)
             current_view = agent_traj.get_current_view()
-            W, H = current_view.size
-            base64_img = encode_image_to_base64(current_view)
             
-            # [Debug] Save monitoring image
-            try:
-                os.makedirs("./results", exist_ok=True) 
-                current_view.save("./results/current_grounding.png")
-            except Exception: pass
+            # Store Original Dimensions for mapping back later
+            orig_w, orig_h = current_view.size 
+            
+            # [CRITICAL] Resize to 1000x1000 for the model
+            target_size = (1000, 1000)
+            resized_view = current_view.resize(target_size, Image.Resampling.LANCZOS)
+            
+            base64_img = encode_image_to_base64(resized_view)
 
-            # 3. Build Prompt (Inject Resolution)
-            system_prompt_with_res = f"{BASELINE_GROUNDING_PROMPT}\n\n# CURRENT STATE\nThe resolution of the image is {W}x{H}."
-            
-            user_content = f"Instruction: {agent_traj.global_question}"
+            # 3. Build Prompt (Fixed 1000x1000 context)
+            # The model thinks it is working on a 1000x1000 screen
+            system_prompt = TOOLS_DEFINITION.replace("{WIDTH}", "1000").replace("{HEIGHT}", "1000")
             
             messages = [
-                {"role": "system", "content": system_prompt_with_res},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_img}"}},
-                        {"type": "text", "text": user_content}
+                        {"type": "text", "text": f"User Query: {agent_traj.global_question}"}
                     ]
                 }
             ]
@@ -169,40 +148,45 @@ class BaselineGroundingRunner(Runner):
                 break
 
             # 5. Parse Output
-            reasoning, action_name, params = self.parse_response(response_text)
+            reasoning, action_type, params = self.parse_response(response_text)
             
             print(f"\n[Step {step+1}]")
             print(f"  Thinking: {reasoning[:100]}...")
-            print(f"  Action:   {action_name} {params}")
+            print(f"  Action:   {action_type} {params}")
             
-            agent_traj.tools.append(f"{action_name} {params}")
+            agent_traj.tools.append(f"{action_type} {params}")
 
-            if not action_name:
-                print(f"  -> [Fail] Invalid JSON format: {response_text[:50]}")
+            if not action_type:
+                # print(f"  -> [Fail] No valid tool_call found: {response_text[:50]}")
                 agent_traj.failed = 1
                 break
 
-            # 6. Execute Logic
-            cx, cy = -1, -1
+            # 6. Execute Logic & Coordinate De-Normalization
+            cx_abs, cy_abs = -1, -1
             
-            # Extract coordinates if "coordinate" exists in params
             if "coordinate" in params:
                 coords = params["coordinate"]
                 if isinstance(coords, list) and len(coords) == 2:
-                    cx, cy = int(coords[0]), int(coords[1])
+                    norm_x, norm_y = coords[0], coords[1]
                     
-                    # Update Cursor Position (Virtual Move)
-                    dx = cx - agent_traj.cursor_pos[0]
-                    dy = cy - agent_traj.cursor_pos[1]
+                    # [CRITICAL] Map 1000x1000 back to Original Resolution
+                    cx_abs = int((norm_x / 1000.0) * orig_w)
+                    cy_abs = int((norm_y / 1000.0) * orig_h)
+                    print(f"  -> Mapped Coordinates: ({cx_abs}, {cy_abs}) in Original Size ({orig_w}, {orig_h})")
+                    
+                    # Update Virtual Cursor Position (Delta based on real dimensions)
+                    dx = cx_abs - agent_traj.cursor_pos[0]
+                    dy = cy_abs - agent_traj.cursor_pos[1]
                     agent_traj.move_cursor(dx, dy)
 
-            # --- Interaction Logic ---
-            # Qwen Agent specific action names
-            click_actions = ["left_click", "right_click", "middle_click", "double_click", "left_click_drag"]
-            
-            if action_name in click_actions:
-                # Verify Hit
-                if self.check_hit(agent_traj.cursor_pos, current_gt.bbox, current_view.size):
+            # --- Dispatch Actions ---
+            if action_type == "mouse_move":
+                pass
+
+            elif action_type == "left_click":
+                # Verify Hit using the absolute coordinates and original size
+                # Note: We use `current_view.size` (original), not `resized_view`
+                if self.check_hit(agent_traj.cursor_pos, current_gt.bbox, (orig_w, orig_h)):
                     print(" -> Hit! Target reached.")
                     
                     if agent_traj.current_gt_step_idx < gt_traj.total_steps - 1:
@@ -215,15 +199,11 @@ class BaselineGroundingRunner(Runner):
                         agent_traj.failed = 0
                         break
                 else:
-                    print(f" -> Miss! Clicked at ({cx}, {cy}).")
+                    print(f" -> Miss! Clicked at ({cx_abs}, {cy_abs}).")
                     agent_traj.failed = 3 
                     break 
 
-            # --- Other Actions ---
-            elif action_name == "type":
-                pass 
-
-            elif action_name == "terminate":
+            elif action_type == "terminate":
                 status = params.get("status", "failure")
                 if status == "success" and agent_traj.current_gt_step_idx >= gt_traj.total_steps:
                      agent_traj.failed = 0
@@ -231,15 +211,10 @@ class BaselineGroundingRunner(Runner):
                      agent_traj.failed = 4
                 break
 
-            elif action_name == "wait":
-                pass 
-
-            elif action_name == "mouse_move":
-                # Just move, already handled above by coordinate extraction
-                pass
-
             else:
-                print(f" -> [Warn] Unknown command: {action_name}")
+                print(f" -> [Warn] Unknown action type: {action_type}")
+                agent_traj.failed = 1
+                break
         
         # Timeout Check
         if agent_traj.failed == 0 and agent_traj.step_count >= max_steps:

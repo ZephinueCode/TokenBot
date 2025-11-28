@@ -8,6 +8,7 @@ from typing import List, Dict, Tuple, Any
 from io import BytesIO
 from transformers import LogitsProcessor, StoppingCriteria, LogitsProcessorList, StoppingCriteriaList
 
+# Project imports
 from ..utils.parameters import HYPERPARAMS as HP
 from ..utils.action_logic import MOVE_DELTAS, get_action_type
 from .visual_utils import draw_cursor, visualize_trajectory 
@@ -108,13 +109,15 @@ class AgentTrajectory:
         self.tools = []       
         self.images = []      
         self.cursor_path = [tuple(self.cursor_pos)]
+        
+        # [NEW] Track tokens for History Prompt
+        self.action_history_tokens = [] 
+        
         self._update_visual_history()
 
     def _update_visual_history(self):
         clean_copy = self.current_base_image.copy()
         viz_img = draw_cursor(clean_copy, int(self.cursor_pos[0]), int(self.cursor_pos[1]))
-        # [Optimization] Resize to save RAM
-        viz_img = viz_img.resize((HP.IMAGE_SIZE, HP.IMAGE_SIZE), Image.Resampling.LANCZOS)
         self.images.append(viz_img)
 
     def get_current_view(self) -> Image.Image: return self.images[-1]
@@ -136,6 +139,12 @@ class AgentTrajectory:
         w, h = self.current_base_image.size
         self.cursor_pos = [w // 2, h // 2]
         self.cursor_path.append((w // 2, h // 2))
+        
+        # [OPTIONAL] Reset history on new page/step? 
+        # Usually for SFT we keep it continuous within a task, 
+        # or reset if it's a completely new visual context. 
+        # Here we keep it to simulate memory.
+        
         self._update_visual_history()
 
 # =============================================================================
@@ -202,19 +211,29 @@ class Runner:
                 current_gt = gt_traj.get_step(agent_traj.current_gt_step_idx)
                 curr_img = agent_traj.get_current_view()
 
-                # Build Prompt
+                # [NEW] Construct User Prompt with History
+                if not agent_traj.action_history_tokens:
+                    history_str = "None (Start)"
+                else:
+                    # e.g. "<MOVE_RIGHT> -> <MOVE_DOWN>"
+                    history_str = " -> ".join(agent_traj.action_history_tokens)
+                
+                # Matches training format from SFT-2/3
+                final_user_content = f"[Action] Task: {agent_traj.global_question}\nPrevious Actions: {history_str}"
+
+                # Build Message
                 messages = [
                     {"role": "system", "content": AGENT_SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": [
                             {"type": "image", "image": curr_img},
-                            {"type": "text", "text": f"[Action] {agent_traj.global_question}\n"}
+                            {"type": "text", "text": final_user_content}
                         ]
                     }
                 ]
                 
-                # Handle device (DataParallel support)
+                # Handle device
                 if hasattr(model, "module"):
                     device = model.module.device
                 else:
@@ -237,14 +256,9 @@ class Runner:
                         temperature=temperature if temperature > 0 else 1.0,
                         logits_processor=logits_processor,
                         stopping_criteria=stop_criteria,
-                        
-                        # Disable cache for gradient checkpointing compatibility
                         use_cache=False, 
-                        
-                        # [CRITICAL] Enable scores to extract logprobs
                         output_scores=True,
                         return_dict_in_generate=True,
-                        
                         pad_token_id=processor.tokenizer.pad_token_id,
                         eos_token_id=processor.tokenizer.eos_token_id,
                     )
@@ -258,6 +272,7 @@ class Runner:
                 reasoning_str = parts[0].replace("Reasoning:", "").strip()
                 
                 print(f"\n[Step {step+1}]")
+                print(f"  Hist:     {history_str[-50:]}..." if len(history_str) > 50 else f"  Hist:     {history_str}")
                 print(f"  Thinking: {reasoning_str[:100]}...")
 
                 token_text = None
@@ -272,11 +287,7 @@ class Runner:
                             token_text = act
                             
                             if len(generated_ids) > 0:
-                                # 1. Get exact ID
                                 step_action_id = generated_ids[-1].item()
-                                
-                                # 2. Extract Real Logprob from scores
-                                # outputs.scores is tuple (len=generated_len)
                                 last_step_scores = outputs.scores[-1][0] 
                                 log_probs = torch.log_softmax(last_step_scores, dim=-1)
                                 step_logprob = log_probs[step_action_id].item()
@@ -290,6 +301,7 @@ class Runner:
                     print(f"  Action:   {token_text} (ID: {step_action_id}) Prob: {np.exp(step_logprob):.2%}")
                     
                     agent_traj.tools.append(clean_gen_text)
+                    agent_traj.action_history_tokens.append(token_text) # [NEW] Update History
                     all_token_ids.append(step_action_id)
                     all_logprobs.append(step_logprob) 
 
@@ -302,7 +314,10 @@ class Runner:
                         else: agent_traj.failed = 1; break
                     
                     elif token_action_type in ["click", "scroll", "text", "nav"]:
+                        # Logic for interaction
                         if token_action_type != current_gt.action_type:
+                            # Strict matching: if GT says Click but agent says Type -> Fail
+                            # You might want to relax this for real usage
                             agent_traj.failed = 2; break
                         
                         if self.check_hit(agent_traj.cursor_pos, current_gt.bbox, curr_img.size):
@@ -338,7 +353,7 @@ class Runner:
 
                 del inputs, outputs, generated_ids
             
-            # [FIX] Loop finished naturally without break (Hit/Miss/End) = Timeout
+            # Loop finished
             else:
                 print(f"  [Runner] Max steps ({max_steps}) reached. Timeout.")
                 agent_traj.failed = 4
@@ -348,7 +363,7 @@ class Runner:
             torch.cuda.empty_cache()
             agent_traj.failed = 4 
 
-        # [Safety Check] Double-check timeout condition
+        # [Safety Check]
         if agent_traj.failed == 0 and agent_traj.step_count >= max_steps:
              if agent_traj.current_gt_step_idx < gt_traj.total_steps:
                  agent_traj.failed = 4 

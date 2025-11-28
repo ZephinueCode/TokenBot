@@ -7,7 +7,7 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from trl import GRPOConfig
 
 from ..utils.parameters import HYPERPARAMS as HP
-from ..utils.dataset import prepare_grpo1_dataset, train_eval_split
+from ..utils.sft_screenspot_pro import prepare_grpo1_dataset, train_eval_split
 from ..tools.runner import Runner
 from .trainer import ToolGRPOTrainer
 from ..utils.action import ACTION_TOKENS 
