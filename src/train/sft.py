@@ -67,7 +67,7 @@ class WeightedActionTrainer(Trainer):
         raw_loss = raw_loss.view(batch_size, -1)
 
         weights = torch.ones_like(raw_loss)
-        ACTION_WEIGHT = 40.0
+        ACTION_WEIGHT = 10.0
 
         for i in range(batch_size):
             valid_mask = (shift_labels[i] != -100)

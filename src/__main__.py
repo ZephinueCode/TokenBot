@@ -64,6 +64,7 @@ if __name__ == "__main__":
     else:
         print("[Main] Phase 2 output found. Skipping.")
 
+    '''
     # =========================================================================
     # PHASE 3: SFT - Visual Grounding Pro (ScreenSpot Pro)
     # =========================================================================
@@ -79,3 +80,4 @@ if __name__ == "__main__":
     final_path = getattr(HP, "SFT_3_OUTPUT_PATH", "./checkpoints/sft_phase3")
     print(f"PIPELINE COMPLETE. Final Model: {final_path}")
     print("="*60 + "\n")
+    '''

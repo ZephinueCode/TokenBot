@@ -141,6 +141,17 @@ class ScreenSpotProSFTDataset(Dataset):
         except Exception as e:
             raw_img = Image.new("RGB", (HP.IMAGE_SIZE, HP.IMAGE_SIZE), (0, 0, 0))
         
+        orig_w, orig_h = raw_img.size
+        MAX_SIDE = 1280
+        
+        if max(orig_w, orig_h) > MAX_SIDE:
+            scale = MAX_SIDE / max(orig_w, orig_h)
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            raw_img = raw_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        else:
+            scale = 1.0 # No resizing needed
+        
         w, h = raw_img.size
         
         # 2. Scale Target BBox

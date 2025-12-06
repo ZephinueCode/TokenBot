@@ -234,7 +234,7 @@ class WeightedActionTrainer(Trainer):
         del shift_logits
 
         weights = torch.ones_like(raw_loss)
-        ACTION_WEIGHT = 100.0 
+        ACTION_WEIGHT = 20.0 
 
         for i in range(labels.size(0)):
             valid_mask = (shift_labels[i] != -100)
@@ -316,7 +316,7 @@ class ScreenSpotSFTDataset(Dataset):
         
         # --- [NEW] 1. Resize if too large ---
         orig_w, orig_h = raw_img.size
-        MAX_SIDE = 1920
+        MAX_SIDE = 1280
         
         if max(orig_w, orig_h) > MAX_SIDE:
             scale = MAX_SIDE / max(orig_w, orig_h)

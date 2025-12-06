@@ -7,5 +7,5 @@ from huggingface_hub import snapshot_download
 dataset_path = snapshot_download(
     repo_id="osunlp/Multimodal-Mind2Web",
     repo_type="dataset",
-    local_dir="./data/Mind2Web",
+    local_dir="./data/mind2web",
 )
